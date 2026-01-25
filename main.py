@@ -224,6 +224,9 @@ class ChatUI:
 
         self.code_panel = tk.Text(code_frame, wrap="none")
         self.code_panel.grid(row=0, column=0, sticky="nsew")
+        
+        # Bind to sync code_contents when user edits
+        self.code_panel.bind("<<Modified>>", self._on_code_modified)
 
         code_scroll = ttk.Scrollbar(code_frame, command=self.code_panel.yview)
         code_scroll.grid(row=0, column=1, sticky="ns")
@@ -259,6 +262,12 @@ class ChatUI:
     def _bind_keys(self):
         self.input_box.bind("<Return>", self._on_enter)
         self.input_box.bind("<Shift-Return>", lambda e: None)
+    
+    def _on_code_modified(self, event):
+        """Sync code_contents when user edits the code panel."""
+        if self.code_panel.edit_modified():
+            self.code_contents = self.code_panel.get("1.0", "end-1c")
+            self.code_panel.edit_modified(False)
 
     # -----------------------------
     # Input
@@ -274,7 +283,16 @@ class ChatUI:
 
         self.input_box.delete("1.0", "end")
         self._append_chat("You", text)
+        
+        # Add user message to conversation
         self.conversation.append({"role": "user", "content": text})
+        
+        # Add invisible context about current code if it exists
+        if self.code_contents.strip():
+            self.conversation.append({
+                "role": "user",
+                "content": f"Here's my current code:\n{self.code_contents}"
+            })
 
         self._start_generation()
         return "break"
