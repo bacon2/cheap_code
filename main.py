@@ -14,10 +14,6 @@ import json
 # Environment / Client Setup
 # -----------------------------
 
-# -----------------------------
-# Environment / Client Setup
-# -----------------------------
-
 load_dotenv()
 
 groq_client = OpenAI(
