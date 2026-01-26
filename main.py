@@ -6,8 +6,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from dotenv import load_dotenv
 from openai import OpenAI
-from unidiff import PatchSet
-import difflib
 import json
 
 # -----------------------------
@@ -44,7 +42,7 @@ OPENAI_MODELS = [
 ALL_MODELS = GROQ_MODELS + OPENAI_MODELS
 
 CODE_BLOCK_REGEX = re.compile(
-    r"```(?:\w+)?\n(.*?)```",
+    r"```(?:\w+)?\s*(.*?)```",
     re.DOTALL
 )
 
@@ -78,44 +76,6 @@ class CodeProposal(ttk.Frame):
         ttk.Button(button_row, text="Replace", command=lambda: on_replace(code)).pack(side="right", padx=2)
         ttk.Button(button_row, text="Add", command=lambda: on_add(code)).pack(side="right", padx=2)
 
-class ChatWithCode(ttk.Frame):
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        # Scrollable canvas
-        self.canvas = tk.Canvas(self)
-        self.scrollbar = ttk.Scrollbar(self, command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.scrollbar.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-
-        # Inner frame that holds all messages
-        self.inner_frame = ttk.Frame(self.canvas)
-        self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
-
-        # Resize scrollregion when inner_frame changes
-        self.inner_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-
-    def add_message_with_code(self, text: str, code: str, on_replace, on_add):
-        # Text explanation
-        text_label = tk.Label(
-            self.inner_frame,
-            text=text,
-            wraplength=600,
-            justify="left"
-        )
-        text_label.pack(fill="x", padx=5, pady=(5, 0))
-
-        # CodeProposal widget
-        proposal = CodeProposal(self.inner_frame, code, on_replace, on_add)
-        proposal.pack(fill="x", padx=5, pady=(0, 10))
-
-        # Scroll to bottom
-        self.canvas.update_idletasks()
-        self.canvas.yview_moveto(1.0)
-
-
 class ChatUI:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -133,9 +93,9 @@ class ChatUI:
         self.code_contents = ""
 
         # ---- persistence helpers ----
-        self.auto_save_path: str | None = None   # last saved file
+        self.auto_save_path: str | None = None
         self.auto_save_after_id: str | None = None
-        self.auto_save_interval_ms = 30_000      # 30-second auto-save
+        self.auto_save_interval_ms = 30_000
         
         # Default models
         self.chat_model = tk.StringVar(value="llama-3.3-70b-versatile")
@@ -180,9 +140,6 @@ class ChatUI:
             width=40
         )
         helper_dropdown.pack(side="left")
-
-        main_pane = ttk.PanedWindow(self.root, orient="horizontal")
-        main_pane.grid(row=1, column=0, sticky="nsew")
 
         # ----------------------
         # Menu bar
@@ -243,6 +200,11 @@ class ChatUI:
         # Bind to sync code_contents when user edits
         self.code_panel.bind("<<Modified>>", self._on_code_modified)
 
+        # Add this line to bind Ctrl+A to select all code
+        self.code_panel.bind_all("<Control-a>", lambda e: self.code_panel.tag_add("sel", "1.0", "end"))
+
+        self.code_panel.bind("<Control-a>", lambda e: self.code_panel.tag_add("sel", "1.0", "end"))
+
         code_scroll = ttk.Scrollbar(code_frame, command=self.code_panel.yview)
         code_scroll.grid(row=0, column=1, sticky="ns")
         self.code_panel["yscrollcommand"] = code_scroll.set
@@ -257,7 +219,7 @@ class ChatUI:
         self.input_box.grid(row=2, column=0, sticky="nsew")
 
         self.root.update_idletasks()
-        main_pane.sashpos(0, int(self.root.winfo_width() * 0.70))  # 70% chat, 30% code
+        main_pane.sashpos(0, int(self.root.winfo_width() * 0.70))
     
     def _get_client_for_model(self, model: str):
         """Return the appropriate client for the given model."""
@@ -269,9 +231,9 @@ class ChatUI:
     def _get_max_tokens_for_model(self, model: str):
         """Return appropriate max_tokens for the given model."""
         if model in OPENAI_MODELS:
-            return 16000  # 50x larger for OpenAI models
+            return 16000
         else:
-            return 8000   # Default for Groq models
+            return 8000
     
     def _uses_max_completion_tokens(self, model: str):
         """Check if model uses max_completion_tokens instead of max_tokens."""
@@ -415,7 +377,7 @@ class ChatUI:
         
         for part_type, content in parts:
             if part_type == "text":
-                if content.strip():  # Only add non-empty text
+                if content.strip():
                     text_widget = tk.Text(
                         message_container,
                         height=content.count("\n") + 1 + int(len(content) * 0.012),
@@ -460,118 +422,77 @@ class ChatUI:
         return parts
 
     # -----------------------------
-    # Code Handling
+    # Code Handling (Line-Number Based Approach)
     # -----------------------------
-    def _extract_code_blocks(self, text: str) -> list[str]:
-        return CODE_BLOCK_REGEX.findall(text)
+
+    def _add_line_numbers(self, code: str) -> str:
+        """Prepend line numbers to each line of code."""
+        lines = code.split("\n")
+        numbered_lines = [f"{i+1} | {line}" for i, line in enumerate(lines)]
+        return "\n".join(numbered_lines)
 
     def _add_code_via_helper(self, new_code: str):
+        """Ask helper model for insertion point and lines to delete, then apply."""
         if not self.code_contents.strip():
             self._replace_code_panel(new_code)
             return
 
-        diff = self._generate_diff_with_helper(
-            old_code=self.code_contents,
-            new_code=new_code
-        )
-
-        if not diff.strip():
-            return
-
-        try:
-            patched = self._apply_unified_diff(self.code_contents, diff)
-        except Exception as e:
-            self._append_chat("System", diff)
-            self._append_chat("System", f"Diff failed:\n{e}")
-            return
-
-        self.code_contents = patched
-        self.code_panel.delete("1.0", "end")
-        self.code_panel.insert("1.0", patched)
-
-    def _replace_code_panel(self, code: str):
-        self.code_contents = code
-        self.code_panel.delete("1.0", "end")
-        self.code_panel.insert("1.0", code)
-
-    def _fix_diff_hunk_counts(self, diff_text: str) -> str:
-        """Fix incorrect line counts in diff hunk headers."""
-        lines = diff_text.split('\n')
-        fixed_lines = []
-        i = 0
+        # Get insertion instructions from helper model
+        insertion_data = self._get_insertion_instructions(new_code)
         
-        while i < len(lines):
-            line = lines[i]
-            
-            # Check if this is a hunk header
-            if line.startswith('@@'):
-                # Parse the header to get start positions
-                match = re.match(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', line)
-                if match:
-                    old_start = match.group(1)
-                    new_start = match.group(2)
-                    
-                    # Collect hunk lines until next @@ or end
-                    hunk_lines = []
-                    j = i + 1
-                    while j < len(lines) and not lines[j].startswith('@@'):
-                        hunk_lines.append(lines[j])
-                        j += 1
-                    
-                    # Count lines for old and new
-                    old_count = sum(1 for l in hunk_lines if l.startswith('-') or l.startswith(' '))
-                    new_count = sum(1 for l in hunk_lines if l.startswith('+') or l.startswith(' '))
-                    
-                    # Reconstruct the header with correct counts
-                    fixed_header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@"
-                    fixed_lines.append(fixed_header)
-                    fixed_lines.extend(hunk_lines)
-                    
-                    i = j
-                else:
-                    fixed_lines.append(line)
-                    i += 1
-            else:
-                fixed_lines.append(line)
-                i += 1
-        
-        return '\n'.join(fixed_lines)
-
-
-    def _update_code_via_helper(self, new_code: str):
-        diff_text = self._generate_diff_with_helper(
-            old_code=self.code_contents,
-            new_code=new_code,
-        )
-
-        if not diff_text.strip():
+        if not insertion_data:
+            self._append_chat("System", "Helper model did not return valid instructions.")
             return
 
+        # Try to apply the insertion and deletion
         try:
-            patched = self._apply_unified_diff(self.code_contents, diff_text)
+            updated_code = self._apply_line_based_edit(
+                insertion_data["insertion_point"],
+                insertion_data["delete_lines"],
+                new_code
+            )
+            self.code_contents = updated_code
+            self.code_panel.delete("1.0", "end")
+            self.code_panel.insert("1.0", updated_code)
+            self._append_chat("System", "Code updated successfully!")
         except Exception as e:
-            self._append_chat("System", diff_text)
-            self._append_chat("System", f"Diff apply failed:\n{e}")
-            return
+            self._append_chat("System", f"Edit failed: {e}")
 
-        self.code_contents = patched
-        self.code_panel.delete("1.0", "end")
-        self.code_panel.insert("1.0", patched)
-
-    def _generate_diff_with_helper(self, old_code: str, new_code: str) -> str:
+    def _get_insertion_instructions(self, new_code: str) -> dict | None:
+        """Ask helper model for insertion point and lines to delete using line numbers."""
+        # Add line numbers to current code
+        numbered_code = self._add_line_numbers(self.code_contents)
+        
         system_prompt = (
-            "You generate unified diffs that will be applied automatically.\n"
-            "The diff must apply cleanly.\n"
-            "Output ONLY a unified diff.\n"
-            "Do NOT include explanations, prose, or markdown.\n"
-            "Always include file headers using 'a/code.py' and 'b/code.py'.\n"
-            "If no changes are required, output an empty response."
+            "You are a code editing assistant. Your job is to determine where to insert new code "
+            "and which lines (if any) to delete from the existing code.\n\n"
+            "You will receive:\n"
+            "1. The current code with line numbers (format: '1 | code here')\n"
+            "2. New code to insert\n\n"
+            "You must respond ONLY with JSON in this exact format:\n"
+            "{\n"
+            '  "insertion_point": <line_number>,\n'
+            '  "delete_lines": [<line_numbers>]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- insertion_point: The line number AFTER which to insert the new code (use 0 to insert at the beginning)\n"
+            "- delete_lines: Array of line numbers to delete (can be empty [] if just inserting)\n"
+            "- Use the CURRENT line numbers you see - don't worry about how insertion affects numbering\n"
+            "- If replacing code, include those line numbers in delete_lines\n"
+            "- If just inserting, leave delete_lines empty\n\n"
+            "Example 1 - Replace lines 5-7:\n"
+            '{"insertion_point": 4, "delete_lines": [5, 6, 7]}\n\n'
+            "Example 2 - Insert after line 10:\n"
+            '{"insertion_point": 10, "delete_lines": []}\n\n'
+            "Example 3 - Insert at beginning:\n"
+            '{"insertion_point": 0, "delete_lines": []}\n\n'
+            "Respond with ONLY the JSON, no explanations."
         )
 
         user_prompt = (
-            "CURRENT FILE:\n"
-            f"{old_code}\n\n"
-            "NEW CODE TO INTEGRATE:\n"
+            "CURRENT CODE (with line numbers):\n"
+            f"{numbered_code}\n\n"
+            "NEW CODE TO INSERT:\n"
             f"{new_code}\n"
         )
 
@@ -579,7 +500,6 @@ class ChatUI:
         client = self._get_client_for_model(model)
         max_tokens = self._get_max_tokens_for_model(model)
         
-        # Build request parameters
         params = {
             "model": model,
             "messages": [
@@ -588,52 +508,77 @@ class ChatUI:
             ],
         }
         
-        # Use max_completion_tokens for GPT-5.2 and GPT-5-mini
         if self._uses_max_completion_tokens(model):
             params["max_completion_tokens"] = max_tokens
         else:
             params["max_tokens"] = max_tokens
         
-        response = client.chat.completions.create(**params)
+        try:
+            response = client.chat.completions.create(**params)
+            response_text = response.choices[0].message.content or ""
+            
+            print("Helper response:", response_text)
+            
+            # Extract JSON from response (in case model adds markdown)
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(0)
+            
+            data = json.loads(response_text)
+            
+            # Validate response format
+            if "insertion_point" not in data or "delete_lines" not in data:
+                return None
+            
+            if not isinstance(data["insertion_point"], int):
+                return None
+            
+            if not isinstance(data["delete_lines"], list):
+                return None
+            
+            return data
+            
+        except Exception as e:
+            print(f"Error getting insertion instructions: {e}")
+            return None
 
-        diff_text = response.choices[0].message.content or ""
-        return diff_text.strip()
+    def _apply_line_based_edit(self, insertion_point: int, delete_lines: list, new_code: str) -> str:
+        """Apply insertion and deletion based on line numbers."""
+        lines = self.code_contents.split("\n")
+        
+        # Validate line numbers
+        if insertion_point < 0 or insertion_point > len(lines):
+            raise ValueError(f"Invalid insertion point: {insertion_point}")
+        
+        for line_num in delete_lines:
+            if line_num < 1 or line_num > len(lines):
+                raise ValueError(f"Invalid line number to delete: {line_num}")
+        
+        # Convert delete_lines to 0-indexed and sort in reverse order
+        delete_indices = sorted([line_num - 1 for line_num in delete_lines], reverse=True)
+        
+        # Adjust insertion point if we're deleting lines before it
+        adjusted_insertion = insertion_point
+        for idx in delete_indices:
+            if idx < insertion_point:
+                adjusted_insertion -= 1
+        
+        # Delete lines (in reverse order to preserve indices)
+        for idx in delete_indices:
+            del lines[idx]
+        
+        # Insert new code at the adjusted position
+        new_lines = new_code.split("\n")
+        
+        # Insert after the specified line (adjusted_insertion is 0-indexed position)
+        lines[adjusted_insertion:adjusted_insertion] = new_lines
+        
+        return "\n".join(lines)
 
-    def _apply_patch_to_text(self, old_text: str, diff_text: str) -> str:
-        old_lines = old_text.splitlines(keepends=True)
-        print(diff_text)
-        patch = PatchSet(diff_text)
-
-        if len(patch) != 1:
-            raise ValueError("Patch must have exactly one file for code panel")
-
-        patched_file = patch[0]
-        new_lines = []
-        old_idx = 0  # index in old_lines
-
-        for hunk in patched_file:
-            # Add unchanged lines before hunk
-            while old_idx < hunk.source_start - 1:
-                new_lines.append(old_lines[old_idx])
-                old_idx += 1
-
-            # Apply hunk lines
-            for line in hunk:
-                if line.is_added:
-                    new_lines.append(line.value)
-                elif line.is_context:
-                    new_lines.append(old_lines[old_idx])
-                    old_idx += 1
-                elif line.is_removed:
-                    old_idx += 1
-
-        # Add remaining lines after last hunk
-        new_lines.extend(old_lines[old_idx:])
-        return "".join(new_lines)
-
-    def _apply_unified_diff(self, old_text: str, diff_text: str) -> str:
-        fixed_diff = self._fix_diff_hunk_counts(diff_text)
-        return self._apply_patch_to_text(old_text, fixed_diff)
+    def _replace_code_panel(self, code: str):
+        self.code_contents = code
+        self.code_panel.delete("1.0", "end")
+        self.code_panel.insert("1.0", code)
 
     # -----------------------------
     # Persistence
@@ -710,15 +655,6 @@ class ChatUI:
             else:
                 self._append_chat(sender, content)
 
-    def _schedule_auto_save(self):
-        if self.auto_save_path and self.conversation:
-            try:
-                with open(self.auto_save_path, "w", encoding="utf-8") as f:
-                    json.dump(self.conversation, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
-        self.auto_save_after_id = self.root.after(self.auto_save_interval_ms, self._schedule_auto_save)
-
     # -----------------------------
     # UI Helpers
     # -----------------------------
@@ -744,7 +680,7 @@ class ChatUI:
         
         if sender == "Assistant":
             self.current_message_label = body
-            self.current_message_container = container # Keep track of the frame
+            self.current_message_container = container
 
         self.chat_canvas.update_idletasks()
         self.chat_canvas.yview_moveto(1.0)
@@ -755,8 +691,6 @@ class ChatUI:
             self.current_message_label.configure(state="normal")
             self.current_message_label.insert("end", text)
             
-            # Calculate actual content height
-            # We use the text widget's internal 'dlineinfo' or simple line count
             line_count = int(self.current_message_label.index("end-1c").split(".")[0])
             self.current_message_label.configure(height=line_count, state="disabled")
             
