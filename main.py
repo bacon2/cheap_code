@@ -584,6 +584,7 @@ class ChatUI:
 
     def _apply_patch_to_text(self, old_text: str, diff_text: str) -> str:
         old_lines = old_text.splitlines(keepends=True)
+        print(diff_text)
         patch = PatchSet(diff_text)
 
         if len(patch) != 1:
