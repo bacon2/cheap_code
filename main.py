@@ -200,10 +200,13 @@ class ChatUI:
         # Bind to sync code_contents when user edits
         self.code_panel.bind("<<Modified>>", self._on_code_modified)
 
-        # Add this line to bind Ctrl+A to select all code
-        self.code_panel.bind_all("<Control-a>", lambda e: self.code_panel.tag_add("sel", "1.0", "end"))
+        def select_all_code_panel(event):
+            event.widget.tag_add("sel", "1.0", "end")
+            return "break"
 
-        self.code_panel.bind("<Control-a>", lambda e: self.code_panel.tag_add("sel", "1.0", "end"))
+        self.code_panel.bind("<Control-a>", select_all_code_panel)
+        self.code_panel.bind("<Control-A>", select_all_code_panel)
+        self.code_panel.bind("<Command-a>", select_all_code_panel)  # For Mac
 
         code_scroll = ttk.Scrollbar(code_frame, command=self.code_panel.yview)
         code_scroll.grid(row=0, column=1, sticky="ns")
@@ -449,7 +452,8 @@ class ChatUI:
             updated_code = self._apply_line_based_edit(
                 insertion_data["insertion_point"],
                 insertion_data["delete_lines"],
-                new_code
+                new_code,
+                insertion_data["indent_spaces"]
             )
             self.code_contents = updated_code
             self.code_panel.delete("1.0", "end")
@@ -472,20 +476,23 @@ class ChatUI:
             "You must respond ONLY with JSON in this exact format:\n"
             "{\n"
             '  "insertion_point": <line_number>,\n'
-            '  "delete_lines": [<line_numbers>]\n'
+            '  "delete_lines": [<line_numbers>],\n'
+            '  "indent_spaces": <number_of_spaces>\n'
             "}\n\n"
             "Rules:\n"
             "- insertion_point: The line number AFTER which to insert the new code (use 0 to insert at the beginning)\n"
             "- delete_lines: Array of line numbers to delete (can be empty [] if just inserting)\n"
+            "- indent_spaces: Number of spaces to add to the beginning of each line of inserted code (to match surrounding indentation)\n"
             "- Use the CURRENT line numbers you see - don't worry about how insertion affects numbering\n"
             "- If replacing code, include those line numbers in delete_lines\n"
-            "- If just inserting, leave delete_lines empty\n\n"
-            "Example 1 - Replace lines 5-7:\n"
-            '{"insertion_point": 4, "delete_lines": [5, 6, 7]}\n\n'
-            "Example 2 - Insert after line 10:\n"
-            '{"insertion_point": 10, "delete_lines": []}\n\n'
-            "Example 3 - Insert at beginning:\n"
-            '{"insertion_point": 0, "delete_lines": []}\n\n'
+            "- If just inserting, leave delete_lines empty\n"
+            "- Look at the indentation of surrounding code to determine indent_spaces\n\n"
+            "Example 1 - Replace lines 5-7 with 8 spaces of indentation:\n"
+            '{"insertion_point": 4, "delete_lines": [5, 6, 7], "indent_spaces": 8}\n\n'
+            "Example 2 - Insert after line 10 with 4 spaces:\n"
+            '{"insertion_point": 10, "delete_lines": [], "indent_spaces": 4}\n\n'
+            "Example 3 - Insert at beginning with no indentation:\n"
+            '{"insertion_point": 0, "delete_lines": [], "indent_spaces": 0}\n\n'
             "Respond with ONLY the JSON, no explanations."
         )
 
@@ -527,7 +534,7 @@ class ChatUI:
             data = json.loads(response_text)
             
             # Validate response format
-            if "insertion_point" not in data or "delete_lines" not in data:
+            if "insertion_point" not in data or "delete_lines" not in data or "indent_spaces" not in data:
                 return None
             
             if not isinstance(data["insertion_point"], int):
@@ -536,14 +543,17 @@ class ChatUI:
             if not isinstance(data["delete_lines"], list):
                 return None
             
+            if not isinstance(data["indent_spaces"], int):
+                return None
+            
             return data
             
         except Exception as e:
             print(f"Error getting insertion instructions: {e}")
             return None
 
-    def _apply_line_based_edit(self, insertion_point: int, delete_lines: list, new_code: str) -> str:
-        """Apply insertion and deletion based on line numbers."""
+    def _apply_line_based_edit(self, insertion_point: int, delete_lines: list, new_code: str, indent_spaces: int) -> str:
+        """Apply insertion and deletion based on line numbers, with indentation."""
         lines = self.code_contents.split("\n")
         
         # Validate line numbers
@@ -567,11 +577,13 @@ class ChatUI:
         for idx in delete_indices:
             del lines[idx]
         
-        # Insert new code at the adjusted position
+        # Apply indentation to new code
+        indent = " " * indent_spaces
         new_lines = new_code.split("\n")
+        indented_lines = [indent + line for line in new_lines]
         
-        # Insert after the specified line (adjusted_insertion is 0-indexed position)
-        lines[adjusted_insertion:adjusted_insertion] = new_lines
+        # Insert new code at the adjusted position
+        lines[adjusted_insertion:adjusted_insertion] = indented_lines
         
         return "\n".join(lines)
 
