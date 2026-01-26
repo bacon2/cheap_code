@@ -230,14 +230,17 @@ class ChatUI:
         code_scroll.grid(row=0, column=1, sticky="ns")
         self.code_panel["yscrollcommand"] = code_scroll.set
 
-        main_pane.add(chat_frame, weight=1)
-        main_pane.add(code_frame, weight=1)
+        main_pane.add(chat_frame)
+        main_pane.add(code_frame)
 
         # ----------------------
         # Input Box
         # ----------------------
         self.input_box = tk.Text(self.root, height=5, wrap="word")
         self.input_box.grid(row=2, column=0, sticky="nsew")
+
+        self.root.update_idletasks()
+        main_pane.sashpos(0, int(self.root.winfo_width() * 0.70))  # 70% chat, 30% code
     
     def _get_client_for_model(self, model: str):
         """Return the appropriate client for the given model."""
