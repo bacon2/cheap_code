@@ -3,11 +3,12 @@ import re
 import threading
 import queue
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 from dotenv import load_dotenv
 from openai import OpenAI
 from unidiff import PatchSet
 import difflib
+import json
 
 # -----------------------------
 # Environment / Client Setup
@@ -134,6 +135,11 @@ class ChatUI:
         self.current_assistant_buffer = ""
 
         self.code_contents = ""
+
+        # ---- persistence helpers ----
+        self.auto_save_path: str | None = None   # last saved file
+        self.auto_save_after_id: str | None = None
+        self.auto_save_interval_ms = 30_000      # 30-second auto-save
         
         # Default models
         self.chat_model = tk.StringVar(value="llama-3.3-70b-versatile")
@@ -178,6 +184,21 @@ class ChatUI:
             width=40
         )
         helper_dropdown.pack(side="left")
+
+        main_pane = ttk.PanedWindow(self.root, orient="horizontal")
+        main_pane.grid(row=1, column=0, sticky="nsew")
+
+        # ----------------------
+        # Menu bar
+        # ----------------------
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Save conversation…", command=self.save_conversation)
+        file_menu.add_command(label="Load conversation…", command=self.load_conversation)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export markdown…", command=self.export_markdown)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.root.config(menu=menubar)
 
         main_pane = ttk.PanedWindow(self.root, orient="horizontal")
         main_pane.grid(row=1, column=0, sticky="nsew")
@@ -618,7 +639,89 @@ class ChatUI:
         fixed_diff = self._fix_diff_hunk_counts(diff_text)
         return self._apply_patch_to_text(old_text, fixed_diff)
 
+    # -----------------------------
+    # Persistence
+    # -----------------------------
+    def save_conversation(self, path: str | None = None):
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+            if not path:
+                return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.conversation, f, indent=2, ensure_ascii=False)
+            self.auto_save_path = path
+            messagebox.showinfo("Saved", f"Conversation saved to\n{path}")
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
 
+    def load_conversation(self):
+        path = filedialog.askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, list):
+                raise ValueError("File must contain a list of messages.")
+            self.conversation = loaded
+            self.auto_save_path = path
+            self._redraw_chat()
+            messagebox.showinfo("Loaded", f"Conversation loaded from\n{path}")
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+
+    def export_markdown(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".md",
+            filetypes=[("Markdown files", "*.md"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            lines = []
+            for msg in self.conversation:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "system":
+                    continue
+                name = "You" if role == "user" else "Assistant"
+                lines.append(f"**{name}:**\n{content}\n")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            messagebox.showinfo("Exported", f"Markdown exported to\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+    def _redraw_chat(self):
+        for w in self.chat_inner_frame.winfo_children():
+            w.destroy()
+        self.current_message_label = None
+        for msg in self.conversation:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "system":
+                continue
+            sender = "You" if role == "user" else "Assistant"
+            if role == "assistant":
+                self._replace_with_parsed_message(content)
+            else:
+                self._append_chat(sender, content)
+
+    def _schedule_auto_save(self):
+        if self.auto_save_path and self.conversation:
+            try:
+                with open(self.auto_save_path, "w", encoding="utf-8") as f:
+                    json.dump(self.conversation, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        self.auto_save_after_id = self.root.after(self.auto_save_interval_ms, self._schedule_auto_save)
 
     # -----------------------------
     # UI Helpers
