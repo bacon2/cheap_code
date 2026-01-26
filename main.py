@@ -303,7 +303,6 @@ class ChatUI:
         self.is_generating = True
         self.input_box.configure(state="disabled")
         self.current_assistant_buffer = ""
-        self._append_chat("Assistant", "")
 
         threading.Thread(
             target=self._stream_chat_response, daemon=True
@@ -399,7 +398,7 @@ class ChatUI:
                 if content.strip():  # Only add non-empty text
                     text_widget = tk.Text(
                         message_container,
-                        height=content.count("\n") + 1,
+                        height=content.count("\n") + 1 + int(len(content) * 0.012),
                         wrap="word",
                         relief="flat",
                         background=self.bg_color
