@@ -83,7 +83,28 @@ class ChatUI:
         self.root.geometry("1100x650")
 
         self.conversation = [
-            {"role": "system", "content": "You are a helpful assistant."}
+            {"role": "system", "content": """
+You are a coding assistant inside a UI that extracts and applies code blocks verbatim. The user may copy/paste code blocks directly into files. Therefore, code blocks must be **complete, explicit, and directly runnable** (or clearly minimal but still syntactically valid).  
+
+**Critical rule: Never use placeholder elisions** in code blocks or patch instructions. This includes (but is not limited to):  
+- `...` or `…`  
+- `# ...` / `// ...` / `/* ... */`  
+- “(other code)”, “existing code”, “rest of file”, “unchanged”, “omitted”, “same as above/below”  
+- “insert here”, “fill in”, “TODO: add …” (unless the user explicitly asked for TODOs)
+
+If a full-file rewrite would be too long, do **one** of these instead:
+1) Output **multiple complete code blocks** representing each full function/class/module that must be added or replaced, and explicitly name what each block replaces; or  
+2) Ask a **single clarifying question** to reduce scope so you can provide complete code.
+
+When you provide code edits:
+- Ensure the code in each fenced block is self-contained and contains all required imports/definitions for that block to work as presented.  
+- If you reference “add this to X”, you must show the exact insertion target by function/class name (and if needed, quote the exact original lines you’re replacing) — but do not use ellipses.
+
+Formatting rules:
+- Critical rule: Never use placeholder comments to represent code that has already been written
+- Use fenced code blocks only for real code or real patches.
+- If you cannot comply with the no-elision rule, stop and ask for the missing file/context instead of guessing.
+             """}
         ]
 
         self.token_queue = queue.Queue()
@@ -200,14 +221,9 @@ class ChatUI:
         # Bind to sync code_contents when user edits
         self.code_panel.bind("<<Modified>>", self._on_code_modified)
 
-        def select_all_code_panel(event):
-            event.widget.tag_add("sel", "1.0", "end")
-            return "break"
-
-        self.code_panel.bind("<Control-a>", select_all_code_panel)
-        self.code_panel.bind("<Control-A>", select_all_code_panel)
-        self.code_panel.bind("<Command-a>", select_all_code_panel)  # For Mac
-
+        # Add this line to bind Ctrl+A to select all code
+        self.code_panel.bind("<Control-a>", lambda e: (self.code_panel.tag_add("sel", "1.0", "end"), "break")[1])
+        
         code_scroll = ttk.Scrollbar(code_frame, command=self.code_panel.yview)
         code_scroll.grid(row=0, column=1, sticky="ns")
         self.code_panel["yscrollcommand"] = code_scroll.set
@@ -329,21 +345,19 @@ class ChatUI:
         try:
             while True:
                 token = self.token_queue.get_nowait()
-    
+
                 if token is None:
                     self._finalize_assistant_message()
                     break
-    
+
                 self.current_assistant_buffer += token
                 self._append_to_last_chat(token)
-    
+
         except queue.Empty:
             pass
-        except Exception as e:
-            print(f"Error polling tokens: {e}")
-    
+
         self.root.after(20, self._poll_tokens)
-    
+
     def _finalize_assistant_message(self):
         assistant_text = self.current_assistant_buffer
         self.conversation.append({"role": "assistant", "content": assistant_text})
@@ -465,7 +479,7 @@ class ChatUI:
             self._append_chat("System", f"Edit failed: {e}")
 
     def _get_insertion_instructions(self, new_code: str) -> dict | None:
-        """Ask helper model for insertion point and lines to delete using line numbers."""
+        """Ask helper model for insertion point and lines to delete using line numbers, with verification."""
         # Add line numbers to current code
         numbered_code = self._add_line_numbers(self.code_contents)
         
@@ -509,12 +523,84 @@ class ChatUI:
         client = self._get_client_for_model(model)
         max_tokens = self._get_max_tokens_for_model(model)
         
+        # First attempt
+        conversation = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        
+        data = self._call_helper_and_parse(client, model, max_tokens, conversation)
+        
+        if not data:
+            return None
+        
+        print("First attempt JSON:", data)
+        
+        # Apply the edit and show result to model for verification
+        try:
+            updated_code = self._apply_line_based_edit(
+                data["insertion_point"],
+                data["delete_lines"],
+                new_code,
+                data["indent_spaces"]
+            )
+            
+            # Show the result to the model for verification
+            numbered_result = self._add_line_numbers(updated_code)
+            
+            verification_prompt = (
+                "Here is the result of applying your edit instructions:\n\n"
+                f"{numbered_result}\n\n"
+                "Does this look correct? Did the new code get inserted in the right place with proper indentation?\n"
+                "If YES, respond with just: CORRECT\n"
+                "If NO, provide a corrected JSON with the right insertion_point, delete_lines, and indent_spaces.\n"
+                "Remember the original code had these line numbers:\n"
+                f"{numbered_code}\n"
+            )
+            
+            conversation.append({"role": "assistant", "content": json.dumps(data)})
+            conversation.append({"role": "user", "content": verification_prompt})
+            
+            params = {
+                "model": model,
+                "messages": conversation,
+            }
+            
+            if self._uses_max_completion_tokens(model):
+                params["max_completion_tokens"] = max_tokens
+            else:
+                params["max_tokens"] = max_tokens
+            
+            verification_response = client.chat.completions.create(**params)
+            verification_text = verification_response.choices[0].message.content or ""
+            
+            print("Verification response:", verification_text)
+            
+            # Check if model says it's correct
+            if "CORRECT" in verification_text.upper():
+                print("Model verified the edit is correct")
+                return data
+            
+            # Try to extract corrected JSON
+            corrected_data = self._extract_json_from_text(verification_text)
+            
+            if corrected_data and self._validate_json_format(corrected_data):
+                print("Second attempt JSON:", corrected_data)
+                return corrected_data
+            
+            # If no valid correction, return original
+            print("No valid correction provided, using original")
+            return data
+            
+        except Exception as e:
+            print(f"Error during verification: {e}")
+            return data
+
+    def _call_helper_and_parse(self, client, model: str, max_tokens: int, conversation: list) -> dict | None:
+        """Call the helper model and parse JSON response."""
         params = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": conversation,
         }
         
         if self._uses_max_completion_tokens(model):
@@ -528,31 +614,43 @@ class ChatUI:
             
             print("Helper response:", response_text)
             
-            # Extract JSON from response (in case model adds markdown)
-            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(0)
-            
-            data = json.loads(response_text)
-            
-            # Validate response format
-            if "insertion_point" not in data or "delete_lines" not in data or "indent_spaces" not in data:
-                return None
-            
-            if not isinstance(data["insertion_point"], int):
-                return None
-            
-            if not isinstance(data["delete_lines"], list):
-                return None
-            
-            if not isinstance(data["indent_spaces"], int):
-                return None
-            
-            return data
+            return self._extract_json_from_text(response_text)
             
         except Exception as e:
-            print(f"Error getting insertion instructions: {e}")
+            print(f"Error calling helper: {e}")
             return None
+    
+    def _extract_json_from_text(self, text: str) -> dict | None:
+        """Extract and parse JSON from text that may contain markdown or other content."""
+        # Try to find JSON in the text
+        json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+        
+        try:
+            data = json.loads(text)
+            if self._validate_json_format(data):
+                return data
+        except:
+            pass
+        
+        return None
+    
+    def _validate_json_format(self, data: dict) -> bool:
+        """Validate that JSON has required fields with correct types."""
+        if "insertion_point" not in data or "delete_lines" not in data or "indent_spaces" not in data:
+            return False
+        
+        if not isinstance(data["insertion_point"], int):
+            return False
+        
+        if not isinstance(data["delete_lines"], list):
+            return False
+        
+        if not isinstance(data["indent_spaces"], int):
+            return False
+        
+        return True
 
     def _apply_line_based_edit(self, insertion_point: int, delete_lines: list, new_code: str, indent_spaces: int) -> str:
         """Apply insertion and deletion based on line numbers, with indentation."""
@@ -673,84 +771,46 @@ class ChatUI:
     # UI Helpers
     # -----------------------------
 
-    # -----------------------------
-    # UI Helpers
-    # -----------------------------
     def _append_chat(self, sender: str, text: str):
+        """Modified for tighter user message spacing."""
         container = ttk.Frame(self.chat_inner_frame)
-        container.pack(fill="x", padx=10, pady=2)
-    
-        header = tk.Text(
-            container,
-            height=1,
-            font=("TkDefaultFont", 10, "bold"),
-            relief="flat",
-            bg=self.bg_color,
-            highlightthickness=0,
-        )
+        container.pack(fill="x", padx=10, pady=5)
+
+        header = tk.Text(container, height=1, font=("TkDefaultFont", 10, "bold"),
+                        relief="flat", background=self.bg_color, highlightthickness=0)
         header.insert("1.0", f"{sender}:")
         header.configure(state="disabled")
         header.pack(fill="x")
-    
-        body = tk.Text(
-            container,
-            wrap="word",
-            relief="flat",
-            bg=self.bg_color,
-            highlightthickness=0,
-        )
+
+        # Dynamic height for content
+        line_count = text.count("\n") + 1
+        body = tk.Text(container, height=line_count, wrap="word", relief="flat",
+                      background=self.bg_color, highlightthickness=0)
         body.insert("1.0", text)
         body.configure(state="disabled")
-        body.pack(fill="x")
-    
-        def _set_height():
-            body.update_idletasks()
-            # displaylines counts wrapped lines (what you actually see)
-            display_lines = body.count("1.0", "end-1c", "displaylines")[0] + 1
-            max_lines = 20  # feel free to tune
-            body.configure(height=max(1, min(display_lines, max_lines)))
-    
-        self.root.after_idle(_set_height)
-    
+        body.pack(fill="x", padx=5)
+        
         if sender == "Assistant":
             self.current_message_label = body
             self.current_message_container = container
-    
+
         self.chat_canvas.update_idletasks()
         self.chat_canvas.yview_moveto(1.0)
-    
-    
-    def _append_to_last_chat(self, text: str):
-        """Streaming: grow the assistant bubble by display lines."""
-        if not self.current_message_label:
-            return
-    
-        lbl = self.current_message_label
-        lbl.configure(state="normal")
-        lbl.insert("end", text)
-        lbl.configure(state="disabled")
-    
-        lbl.update_idletasks()
-        display_lines = lbl.count("1.0", "end-1c", "displaylines")[0]
-        lbl.configure(height=max(1, min(display_lines, 20)))
-    
-        if self.current_message_label:
-            lbl = self.current_message_label
-            lbl.configure(state="normal")
-            lbl.insert("end", text)
-            lbl.configure(state="disabled")
 
-            lbl.update_idletasks()
-            lines = int(lbl.index("end-1c").split(".")[0])
-            lbl.configure(height=max(1, min(lines, 12)))
-    
+    def _append_to_last_chat(self, text: str):
+        """Append text and grow the text widget height dynamically."""
+        if self.current_message_label:
+            self.current_message_label.configure(state="normal")
+            self.current_message_label.insert("end", text)
+            
+            line_count = int(self.current_message_label.index("end-1c").split(".")[0])
+            self.current_message_label.configure(height=line_count, state="disabled")
+            
+            self.chat_canvas.update_idletasks()
+            self.chat_canvas.yview_moveto(1.0)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
     ChatUI(root)
     root.mainloop()
-
-
-
-
-
