@@ -83,7 +83,7 @@ class ChatUI:
         self.root.geometry("1100x650")
 
         self.conversation = [
-            {"role": "system", "content": "You are a helpful assistant."}
+            {"role": "system", "content": "You are a helpful coding assistant. Your code snippets must never contain ellipses, or any comment meant to represent code. "}
         ]
 
         self.token_queue = queue.Queue()
@@ -151,7 +151,6 @@ class ChatUI:
         file_menu.add_command(label="Save conversation…", command=self.save_conversation)
         file_menu.add_command(label="Load conversation…", command=self.load_conversation)
         file_menu.add_separator()
-        file_menu.add_command(label="Export markdown…", command=self.export_markdown)
         menubar.add_cascade(label="File", menu=file_menu)
         self.root.config(menu=menubar)
 
@@ -203,19 +202,7 @@ class ChatUI:
         self.code_panel.bind("<<Modified>>", self._on_code_modified)
 
         # Add this line to bind Ctrl+A to select all code
-        self.code_panel.bind("<Control-a>", lambda e: self.code_panel.tag_add("sel", "1.0", "end"))
-        # Add this line to bind Ctrl+A to select all code
         self.code_panel.bind_all("<Control-a>", self._select_all_code)
-        self.code_panel.bind_all("<Control-A>", self._select_all_code)
-        
-        self.code_panel.bind_all("<Control-Shift-A>", self._select_all_code)
-        
-        
-        
-        # In the _build_layout method of ChatUI class, add the following lines after creating the code_panel:
-        self.code_panel.bind("<Control-a>", self._select_all_code)
-        def _select_all_code(self, event=None):
-            self.code_panel.tag_add("sel", "1.0", "end")
         
         
 
@@ -474,10 +461,11 @@ class ChatUI:
             self._append_chat("System", f"Edit failed: {e}")
 
     def _get_insertion_instructions(self, new_code: str) -> dict | None:
-        """Ask helper model for insertion point and lines to delete using line numbers, with verification."""
-        # Add line numbers to current code
+        """
+        Ask helper model for insertion point and lines to delete using line numbers,
+        with up to 3 verification attempts.
+        """
         numbered_code = self._add_line_numbers(self.code_contents)
-        
         system_prompt = (
             "You are a code editing assistant. Your job is to determine where to insert new code "
             "and which lines (if any) to delete from the existing code.\n\n"
@@ -508,7 +496,9 @@ class ChatUI:
         )
 
         user_prompt = (
-            "CURRENT CODE (with line numbers):\n"
+            "LAST ASSISTANT MESSAGE:\n"
+            f"{self.conversation[-1]['content']}\n"
+            "OLD CODE (with line numbers):\n"
             f"{numbered_code}\n\n"
             "NEW CODE TO INSERT:\n"
             f"{new_code}\n"
@@ -517,92 +507,81 @@ class ChatUI:
         model = self.helper_model.get()
         client = self._get_client_for_model(model)
         max_tokens = self._get_max_tokens_for_model(model)
-        
-        # First attempt
+
         conversation = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        
+
+        # Initial attempt
         data = self._call_helper_and_parse(client, model, max_tokens, conversation)
-        
         if not data:
             return None
-        
-        print("First attempt JSON:", data)
-        
-        # Apply the edit and show result to model for verification
-        try:
-            updated_code = self._apply_line_based_edit(
-                data["insertion_point"],
-                data["delete_lines"],
-                new_code,
-                data["indent_spaces"]
-            )
-            
-            # Get the context snippet showing only the modification area
-            context_snippet = self._get_modification_context(
-                updated_code,
-                data["insertion_point"],
-                data["delete_lines"],
-                new_code,
-                data["indent_spaces"]
-            )
-            
-            verification_prompt = (
-                "Here is the RESULT of your edit (showing only the modified section with 3 lines before and after):\n\n"
-                f"{context_snippet}\n\n"
-                "Check carefully:\n"
-                "- Is the indentation correct?\n"
-                "- Is the new code in the right place?\n"
-                "- Are there any duplicate lines?\n"
-                "- Does it match the surrounding code style?\n\n"
-                "If everything looks CORRECT, respond with just: CORRECT\n"
-                "If something is WRONG, provide corrected JSON with the right insertion_point, delete_lines, and indent_spaces.\n"
-            )
-            
-            conversation.append({"role": "assistant", "content": json.dumps(data)})
-            conversation.append({"role": "user", "content": verification_prompt})
-            
-            params = {
-                "model": model,
-                "messages": conversation,
-            }
-            
-            if self._uses_max_completion_tokens(model):
-                params["max_completion_tokens"] = max_tokens
-            else:
-                params["max_tokens"] = max_tokens
-            
-            verification_response = client.chat.completions.create(**params)
-            verification_text = verification_response.choices[0].message.content or ""
-            
-            print("Verification response:", verification_text)
-            
-            # Check if model says it's correct
-            if "CORRECT" in verification_text.upper():
-                print("Model verified the edit is correct")
-                return data
-            
-            # Try to extract corrected JSON
-            corrected_data = self._extract_json_from_text(verification_text)
-            
-            if corrected_data and self._validate_json_format(corrected_data):
-                print("Second attempt JSON:", corrected_data)
-                return corrected_data
-            
-            # If no valid correction, return original
-            print("No valid correction provided, using original")
-            return data
-            
-        except Exception as e:
-            print(f"Error during verification: {e}")
-            return data
+
+        # Up to 3 verification loops
+        for attempt in range(3):
+            try:
+                updated_code = self._apply_line_based_edit(
+                    data["insertion_point"],
+                    data["delete_lines"],
+                    new_code,
+                    data["indent_spaces"]
+                )
+                context_snippet = self._get_modification_context(
+                    updated_code,
+                    data["insertion_point"],
+                    data["delete_lines"],
+                    new_code,
+                    data["indent_spaces"]
+                )
+                verification_prompt = (
+                    "Here is the RESULT of your edit (showing only the modified section with 3 lines before and after):\n\n"
+                    f"{context_snippet}\n\n"
+                    "Check carefully:\n"
+                    "- Is the indentation correct?\n"
+                    "- Is the new code in the right place?\n"
+                    "- Are there any duplicate lines?\n"
+                    "- Does it match the surrounding code style?\n\n"
+                    "If everything looks CORRECT, respond with just: CORRECT\n"
+                    "If something is WRONG, provide corrected JSON with the right insertion_point, delete_lines, and indent_spaces.\n"
+                    "The JSON values you provide should refer to line numbers in the ORIGINAL, OLD CODE."
+                )
+                conversation.append({"role": "assistant", "content": json.dumps(data)})
+                conversation.append({"role": "user", "content": verification_prompt})
+
+                params = {
+                    "model": model,
+                    "messages": conversation,
+                }
+
+                if self._uses_max_completion_tokens(model):
+                    params["max_completion_tokens"] = max_tokens
+                else:
+                    params["max_tokens"] = max_tokens
+
+                verification_response = client.chat.completions.create(**params)
+                verification_text = verification_response.choices[0].message.content or ""
+
+                if "CORRECT" in verification_text.upper():
+                    return data
+
+                corrected_data = self._extract_json_from_text(verification_text)
+                if corrected_data and self._validate_json_format(corrected_data):
+                    data = corrected_data
+                else:
+                    # No valid correction, stop early
+                    break
+
+            except Exception:
+                # On error, stop verifying
+                break
+
+        return data
 
     def _get_modification_context(self, updated_code: str, insertion_point: int, 
                                    delete_lines: list, new_code: str, indent_spaces: int) -> str:
         """
-        Extract a snippet showing the modification with 3 lines before and after context.
+        Extract a snippet showing the modification with lines before and after context.
         Returns numbered lines.
         """
         lines = updated_code.split("\n")
@@ -625,13 +604,17 @@ class ChatUI:
         start_of_new_code = adjusted_insertion
         end_of_new_code = adjusted_insertion + num_inserted
         
-        # Get 3 lines before and after
-        context_start = max(0, start_of_new_code - 3)
-        context_end = min(len(lines), end_of_new_code + 3)
+        # Get lines before and after
+        context_start = max(0, start_of_new_code - num_inserted * 4)
+        context_end = min(len(lines), end_of_new_code + num_inserted * 4)
         
         # Extract the context
-        context_lines = lines[context_start:context_end]
-        
+        context_lines = []
+        if context_start > 0:
+            context_lines += "... (earlier code)"
+        context_lines += lines[context_start:context_end]
+        if context_end < len(lines):
+            context_lines += "... (later code)"
         # Add line numbers (starting from context_start + 1)
         numbered_context = []
         for i, line in enumerate(context_lines):
@@ -764,38 +747,29 @@ class ChatUI:
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if not isinstance(loaded, list):
-                raise ValueError("File must contain a list of messages.")
-            self.conversation = loaded
-            self.auto_save_path = path
-            self._redraw_chat()
-            messagebox.showinfo("Loaded", f"Conversation loaded from\n{path}")
+                raw = f.read().strip()
+            if not raw:
+                raise ValueError("File is empty.")
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as e:
+            messagebox.showerror("Load error", f"Invalid JSON:\n{e}")
+            return
         except Exception as e:
             messagebox.showerror("Load error", str(e))
-
-    def export_markdown(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".md",
-            filetypes=[("Markdown files", "*.md"), ("All files", "*.*")]
-        )
-        if not path:
             return
-        try:
-            lines = []
-            for msg in self.conversation:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if role == "system":
-                    continue
-                name = "You" if role == "user" else "Assistant"
-                lines.append(f"**{name}:**\n{content}\n")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-            messagebox.showinfo("Exported", f"Markdown exported to\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export error", str(e))
-
+    
+        if not isinstance(loaded, list):
+            messagebox.showerror(
+                "Load error",
+                f"File must contain a list of messages, got {type(loaded).__name__}."
+            )
+            return
+    
+        self.conversation = loaded
+        self.auto_save_path = path
+        self._redraw_chat()
+        messagebox.showinfo("Loaded", f"Conversation loaded from\n{path}")
+    
     def _redraw_chat(self):
         for w in self.chat_inner_frame.winfo_children():
             w.destroy()
@@ -858,3 +832,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     ChatUI(root)
     root.mainloop()
+
