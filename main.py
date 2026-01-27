@@ -329,19 +329,21 @@ class ChatUI:
         try:
             while True:
                 token = self.token_queue.get_nowait()
-
+    
                 if token is None:
                     self._finalize_assistant_message()
                     break
-
+    
                 self.current_assistant_buffer += token
                 self._append_to_last_chat(token)
-
+    
         except queue.Empty:
             pass
-
+        except Exception as e:
+            print(f"Error polling tokens: {e}")
+    
         self.root.after(20, self._poll_tokens)
-
+    
     def _finalize_assistant_message(self):
         assistant_text = self.current_assistant_buffer
         self.conversation.append({"role": "assistant", "content": assistant_text})
@@ -671,46 +673,84 @@ class ChatUI:
     # UI Helpers
     # -----------------------------
 
+    # -----------------------------
+    # UI Helpers
+    # -----------------------------
     def _append_chat(self, sender: str, text: str):
-        """Modified for tighter user message spacing."""
         container = ttk.Frame(self.chat_inner_frame)
-        container.pack(fill="x", padx=10, pady=5)
-
-        header = tk.Text(container, height=1, font=("TkDefaultFont", 10, "bold"),
-                        relief="flat", background=self.bg_color, highlightthickness=0)
+        container.pack(fill="x", padx=10, pady=2)
+    
+        header = tk.Text(
+            container,
+            height=1,
+            font=("TkDefaultFont", 10, "bold"),
+            relief="flat",
+            bg=self.bg_color,
+            highlightthickness=0,
+        )
         header.insert("1.0", f"{sender}:")
         header.configure(state="disabled")
         header.pack(fill="x")
-
-        # Dynamic height for content
-        line_count = text.count("\n") + 1
-        body = tk.Text(container, height=line_count, wrap="word", relief="flat",
-                      background=self.bg_color, highlightthickness=0)
+    
+        body = tk.Text(
+            container,
+            wrap="word",
+            relief="flat",
+            bg=self.bg_color,
+            highlightthickness=0,
+        )
         body.insert("1.0", text)
         body.configure(state="disabled")
-        body.pack(fill="x", padx=5)
-        
+        body.pack(fill="x")
+    
+        def _set_height():
+            body.update_idletasks()
+            # displaylines counts wrapped lines (what you actually see)
+            display_lines = body.count("1.0", "end-1c", "displaylines")[0] + 1
+            max_lines = 20  # feel free to tune
+            body.configure(height=max(1, min(display_lines, max_lines)))
+    
+        self.root.after_idle(_set_height)
+    
         if sender == "Assistant":
             self.current_message_label = body
             self.current_message_container = container
-
+    
         self.chat_canvas.update_idletasks()
         self.chat_canvas.yview_moveto(1.0)
-
+    
+    
     def _append_to_last_chat(self, text: str):
-        """Append text and grow the text widget height dynamically."""
+        """Streaming: grow the assistant bubble by display lines."""
+        if not self.current_message_label:
+            return
+    
+        lbl = self.current_message_label
+        lbl.configure(state="normal")
+        lbl.insert("end", text)
+        lbl.configure(state="disabled")
+    
+        lbl.update_idletasks()
+        display_lines = lbl.count("1.0", "end-1c", "displaylines")[0]
+        lbl.configure(height=max(1, min(display_lines, 20)))
+    
         if self.current_message_label:
-            self.current_message_label.configure(state="normal")
-            self.current_message_label.insert("end", text)
-            
-            line_count = int(self.current_message_label.index("end-1c").split(".")[0])
-            self.current_message_label.configure(height=line_count, state="disabled")
-            
-            self.chat_canvas.update_idletasks()
-            self.chat_canvas.yview_moveto(1.0)
+            lbl = self.current_message_label
+            lbl.configure(state="normal")
+            lbl.insert("end", text)
+            lbl.configure(state="disabled")
 
+            lbl.update_idletasks()
+            lines = int(lbl.index("end-1c").split(".")[0])
+            lbl.configure(height=max(1, min(lines, 12)))
+    
 
 if __name__ == "__main__":
     root = tk.Tk()
     ChatUI(root)
     root.mainloop()
+
+
+
+
+
