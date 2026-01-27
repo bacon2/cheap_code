@@ -83,7 +83,7 @@ class ChatUI:
         self.root.geometry("1100x650")
 
         self.conversation = [
-            {"role": "system", "content": "You are a helpful coding assistant. Your code snippets must never contain ellipses, or any comment meant to represent code. "}
+            {"role": "system", "content": "You are a helpful coding assistant."}
         ]
 
         self.token_queue = queue.Queue()
@@ -100,6 +100,10 @@ class ChatUI:
         # Default models
         self.chat_model = tk.StringVar(value="llama-3.3-70b-versatile")
         self.helper_model = tk.StringVar(value="llama-3.3-70b-versatile")
+        
+        # Temperature controls
+        self.chat_temp = tk.DoubleVar(value=0.7)
+        self.helper_temp = tk.DoubleVar(value=0.3)
 
         self._build_layout()
         self._bind_keys()
@@ -117,31 +121,71 @@ class ChatUI:
         self.root.rowconfigure(2, weight=0)
         self.root.columnconfigure(0, weight=1)
 
+        
         # ----------------------
         # Model Selection Bar
         # ----------------------
         model_frame = ttk.Frame(self.root)
         model_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-        
-        ttk.Label(model_frame, text="Chat Model:").pack(side="left", padx=(0, 5))
+
+        # ---------- Chat model column ----------
+        chat_col = ttk.Frame(model_frame)
+        chat_col.pack(side="left", padx=(0, 30))
+
+        ttk.Label(chat_col, text="Chat Model:").pack(anchor="w")
         chat_dropdown = ttk.Combobox(
-            model_frame,
+            chat_col,
             textvariable=self.chat_model,
             values=ALL_MODELS,
             state="readonly",
             width=40
         )
-        chat_dropdown.pack(side="left", padx=(0, 20))
-        
-        ttk.Label(model_frame, text="Helper Model:").pack(side="left", padx=(0, 5))
+        chat_dropdown.pack(anchor="w")
+
+        chat_temp_frame = ttk.Frame(chat_col)
+        chat_temp_frame.pack(anchor="w", pady=(5, 0))
+        ttk.Label(chat_temp_frame, text="Temp:").pack(side="left")
+        chat_temp_scale = ttk.Scale(
+            chat_temp_frame,
+            from_=0.0,
+            to=1.0,
+            variable=self.chat_temp,
+            orient="horizontal",
+            length=100
+        )
+        chat_temp_scale.pack(side="left", padx=(5, 0))
+        self.chat_temp_label = ttk.Label(chat_temp_frame, textvariable=self.chat_temp)
+        self.chat_temp_label.pack(side="left", padx=(5, 0))
+
+        # ---------- Helper model column ----------
+        helper_col = ttk.Frame(model_frame)
+        helper_col.pack(side="left")
+
+        ttk.Label(helper_col, text="Helper Model:").pack(anchor="w")
         helper_dropdown = ttk.Combobox(
-            model_frame,
+            helper_col,
             textvariable=self.helper_model,
             values=ALL_MODELS,
             state="readonly",
             width=40
         )
-        helper_dropdown.pack(side="left")
+        helper_dropdown.pack(anchor="w")
+
+        helper_temp_frame = ttk.Frame(helper_col)
+        helper_temp_frame.pack(anchor="w", pady=(5, 0))
+        ttk.Label(helper_temp_frame, text="Temp:").pack(side="left")
+        helper_temp_scale = ttk.Scale(
+            helper_temp_frame,
+            from_=0.0,
+            to=1.0,
+            variable=self.helper_temp,
+            orient="horizontal",
+            length=100
+        )
+        helper_temp_scale.pack(side="left", padx=(5, 0))
+        self.helper_temp_label = ttk.Label(helper_temp_frame, textvariable=self.helper_temp)
+        self.helper_temp_label.pack(side="left", padx=(5, 0))
+        
 
         # ----------------------
         # Menu bar
@@ -272,7 +316,7 @@ class ChatUI:
         if self.code_contents.strip():
             self.conversation.append({
                 "role": "user",
-                "content": f"Here's my current code:\n{self.code_contents}"
+                "content": f"Here's my current code:\n```{self.code_contents}```\n Here are my rules: **Never use ellipses or any placeholder text—inside or outside comments—to indicate omitted code; always supply the complete, runnable snippet.** Avoid rewriting entire files unless specifically asked."
             })
 
         self._start_generation()
@@ -302,6 +346,7 @@ class ChatUI:
                 "model": model,
                 "messages": self.conversation,
                 "stream": True,
+                "temperature": self.chat_temp.get(),
             }
             
             # Use max_completion_tokens for GPT-5.2 and GPT-5-mini
@@ -469,33 +514,35 @@ class ChatUI:
         system_prompt = (
             "You are a code editing assistant. Your job is to determine where to insert new code "
             "and which lines (if any) to delete from the existing code.\n\n"
+        )
+
+        user_prompt = (
             "You will receive:\n"
             "1. The current code with line numbers (format: '1 | code here')\n"
             "2. New code to insert\n\n"
             "You must respond ONLY with JSON in this exact format:\n"
             "{\n"
-            '  "insertion_point": <line_number>,\n'
-            '  "delete_lines": [<line_numbers>],\n'
-            '  "indent_spaces": <number_of_spaces>\n'
+            '  \"insertion_point\": <line_number>,\n'
+            '  \"delete_lines\": [<line_numbers>],\n'
+            '  \"indent_spaces\": <number_of_spaces>\n'
             "}\n\n"
             "Rules:\n"
             "- insertion_point: The line number AFTER which to insert the new code (use 0 to insert at the beginning)\n"
             "- delete_lines: Array of line numbers to delete (can be empty [] if just inserting)\n"
-            "- indent_spaces: Number of spaces to add to the beginning of each line of inserted code (to match surrounding indentation)\n"
-            "- Use the CURRENT line numbers you see - don't worry about how insertion affects numbering\n"
-            "- If replacing code, include those line numbers in delete_lines\n"
-            "- If just inserting, leave delete_lines empty\n"
-            "- Look at the indentation of surrounding code to determine indent_spaces\n\n"
-            "Example 1 - Replace lines 5-7 with 8 spaces of indentation:\n"
-            '{"insertion_point": 4, "delete_lines": [5, 6, 7], "indent_spaces": 8}\n\n'
-            "Example 2 - Insert after line 10 with 4 spaces:\n"
-            '{"insertion_point": 10, "delete_lines": [], "indent_spaces": 4}\n\n'
-            "Example 3 - Insert at beginning with no indentation:\n"
-            '{"insertion_point": 0, "delete_lines": [], "indent_spaces": 0}\n\n'
-            "Respond with ONLY the JSON, no explanations."
-        )
-
-        user_prompt = (
+            "- IMPORTANT: Do NOT try to match or adjust indentation.\n"
+            "- IMPORTANT: Assume NEW CODE TO INSERT already has the correct indentation exactly as it should appear in the file.\n"
+            "- Therefore, indent_spaces MUST be 0 in normal operation.\n"
+            "- Only set indent_spaces to a nonzero value if the user explicitly requests automatic indentation.\n"
+            "- Use the CURRENT line numbers you see - don't worry about how insertion affects numbering.\n"
+            "- If replacing code, include those line numbers in delete_lines.\n"
+            "- If just inserting, leave delete_lines empty.\n\n"
+            "Example 1 - Replace lines 5-7 (no auto-indentation):\n"
+            "{\"insertion_point\": 4, \"delete_lines\": [5, 6, 7], \"indent_spaces\": 0}\n\n"
+            "Example 2 - Insert after line 10 (no auto-indentation):\n"
+            "{\"insertion_point\": 10, \"delete_lines\": [], \"indent_spaces\": 0}\n\n"
+            "Example 3 - Insert at beginning (no auto-indentation):\n"
+            "{\"insertion_point\": 0, \"delete_lines\": [], \"indent_spaces\": 0}\n\n"
+            "Respond with ONLY the JSON, no explanations.\n"
             "LAST ASSISTANT MESSAGE:\n"
             f"{self.conversation[-1]['content']}\n"
             "OLD CODE (with line numbers):\n"
@@ -552,6 +599,7 @@ class ChatUI:
                 params = {
                     "model": model,
                     "messages": conversation,
+                    "temperature": self.helper_temp.get(),
                 }
 
                 if self._uses_max_completion_tokens(model):
@@ -628,6 +676,7 @@ class ChatUI:
         params = {
             "model": model,
             "messages": conversation,
+            "temperature": self.helper_temp.get(),
         }
         
         if self._uses_max_completion_tokens(model):
@@ -801,7 +850,7 @@ class ChatUI:
         header.pack(fill="x")
 
         # Dynamic height for content
-        line_count = text.count("\n") + 1
+        line_count = text.count("\n") + 2
         body = tk.Text(container, height=line_count, wrap="word", relief="flat",
                       background=self.bg_color, highlightthickness=0)
         body.insert("1.0", text)
@@ -832,4 +881,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     ChatUI(root)
     root.mainloop()
-
