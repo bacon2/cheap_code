@@ -83,28 +83,7 @@ class ChatUI:
         self.root.geometry("1100x650")
 
         self.conversation = [
-            {"role": "system", "content": """
-You are a coding assistant inside a UI that extracts and applies code blocks verbatim. The user may copy/paste code blocks directly into files. Therefore, code blocks must be **complete, explicit, and directly runnable** (or clearly minimal but still syntactically valid).  
-
-**Critical rule: Never use placeholder elisions** in code blocks or patch instructions. This includes (but is not limited to):  
-- `...` or `…`  
-- `# ...` / `// ...` / `/* ... */`  
-- “(other code)”, “existing code”, “rest of file”, “unchanged”, “omitted”, “same as above/below”  
-- “insert here”, “fill in”, “TODO: add …” (unless the user explicitly asked for TODOs)
-
-If a full-file rewrite would be too long, do **one** of these instead:
-1) Output **multiple complete code blocks** representing each full function/class/module that must be added or replaced, and explicitly name what each block replaces; or  
-2) Ask a **single clarifying question** to reduce scope so you can provide complete code.
-
-When you provide code edits:
-- Ensure the code in each fenced block is self-contained and contains all required imports/definitions for that block to work as presented.  
-- If you reference “add this to X”, you must show the exact insertion target by function/class name (and if needed, quote the exact original lines you’re replacing) — but do not use ellipses.
-
-Formatting rules:
-- Critical rule: Never use placeholder comments to represent code that has already been written
-- Use fenced code blocks only for real code or real patches.
-- If you cannot comply with the no-elision rule, stop and ask for the missing file/context instead of guessing.
-             """}
+            {"role": "system", "content": "You are a helpful assistant."}
         ]
 
         self.token_queue = queue.Queue()
@@ -129,6 +108,8 @@ Formatting rules:
     # -----------------------------
     # Layout
     # -----------------------------
+    def _select_all_code(self, event=None):
+        self.code_panel.tag_add("sel", "1.0", "end")
 
     def _build_layout(self) -> None:
         self.root.rowconfigure(0, weight=0)
@@ -222,8 +203,22 @@ Formatting rules:
         self.code_panel.bind("<<Modified>>", self._on_code_modified)
 
         # Add this line to bind Ctrl+A to select all code
-        self.code_panel.bind("<Control-a>", lambda e: (self.code_panel.tag_add("sel", "1.0", "end"), "break")[1])
+        self.code_panel.bind("<Control-a>", lambda e: self.code_panel.tag_add("sel", "1.0", "end"))
+        # Add this line to bind Ctrl+A to select all code
+        self.code_panel.bind_all("<Control-a>", self._select_all_code)
+        self.code_panel.bind_all("<Control-A>", self._select_all_code)
         
+        self.code_panel.bind_all("<Control-Shift-A>", self._select_all_code)
+        
+        
+        
+        # In the _build_layout method of ChatUI class, add the following lines after creating the code_panel:
+        self.code_panel.bind("<Control-a>", self._select_all_code)
+        def _select_all_code(self, event=None):
+            self.code_panel.tag_add("sel", "1.0", "end")
+        
+        
+
         code_scroll = ttk.Scrollbar(code_frame, command=self.code_panel.yview)
         code_scroll.grid(row=0, column=1, sticky="ns")
         self.code_panel["yscrollcommand"] = code_scroll.set
@@ -545,17 +540,25 @@ Formatting rules:
                 data["indent_spaces"]
             )
             
-            # Show the result to the model for verification
-            numbered_result = self._add_line_numbers(updated_code)
+            # Get the context snippet showing only the modification area
+            context_snippet = self._get_modification_context(
+                updated_code,
+                data["insertion_point"],
+                data["delete_lines"],
+                new_code,
+                data["indent_spaces"]
+            )
             
             verification_prompt = (
-                "Here is the result of applying your edit instructions:\n\n"
-                f"{numbered_result}\n\n"
-                "Does this look correct? Did the new code get inserted in the right place with proper indentation?\n"
-                "If YES, respond with just: CORRECT\n"
-                "If NO, provide a corrected JSON with the right insertion_point, delete_lines, and indent_spaces.\n"
-                "Remember the original code had these line numbers:\n"
-                f"{numbered_code}\n"
+                "Here is the RESULT of your edit (showing only the modified section with 3 lines before and after):\n\n"
+                f"{context_snippet}\n\n"
+                "Check carefully:\n"
+                "- Is the indentation correct?\n"
+                "- Is the new code in the right place?\n"
+                "- Are there any duplicate lines?\n"
+                "- Does it match the surrounding code style?\n\n"
+                "If everything looks CORRECT, respond with just: CORRECT\n"
+                "If something is WRONG, provide corrected JSON with the right insertion_point, delete_lines, and indent_spaces.\n"
             )
             
             conversation.append({"role": "assistant", "content": json.dumps(data)})
@@ -595,6 +598,47 @@ Formatting rules:
         except Exception as e:
             print(f"Error during verification: {e}")
             return data
+
+    def _get_modification_context(self, updated_code: str, insertion_point: int, 
+                                   delete_lines: list, new_code: str, indent_spaces: int) -> str:
+        """
+        Extract a snippet showing the modification with 3 lines before and after context.
+        Returns numbered lines.
+        """
+        lines = updated_code.split("\n")
+        
+        # Calculate where the new code actually is in the updated file
+        # We need to figure out the range of lines that were affected
+        
+        # Start by finding where we inserted
+        num_deleted = len(delete_lines)
+        num_inserted = len(new_code.split("\n"))
+        
+        # The insertion point in the original file
+        original_insertion = insertion_point
+        
+        # In the new file, after deleting lines before the insertion point
+        deleted_before = sum(1 for line_num in delete_lines if line_num <= insertion_point)
+        adjusted_insertion = insertion_point - deleted_before
+        
+        # The new code spans from adjusted_insertion to adjusted_insertion + num_inserted
+        start_of_new_code = adjusted_insertion
+        end_of_new_code = adjusted_insertion + num_inserted
+        
+        # Get 3 lines before and after
+        context_start = max(0, start_of_new_code - 3)
+        context_end = min(len(lines), end_of_new_code + 3)
+        
+        # Extract the context
+        context_lines = lines[context_start:context_end]
+        
+        # Add line numbers (starting from context_start + 1)
+        numbered_context = []
+        for i, line in enumerate(context_lines):
+            line_num = context_start + i + 1
+            numbered_context.append(f"{line_num} | {line}")
+        
+        return "\n".join(numbered_context)
 
     def _call_helper_and_parse(self, client, model: str, max_tokens: int, conversation: list) -> dict | None:
         """Call the helper model and parse JSON response."""
