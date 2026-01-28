@@ -474,21 +474,69 @@ class ChatUI:
         numbered_code = self._add_line_numbers(self.code_contents)
 
         system_prompt = (
-            "You are a deterministic code editing assistant.\n"
-            "You must respond ONLY with JSON in the exact format specified.\n\n"
-            "JSON format:\n"
-            "{\n"
-            '  "anchor_line": <line_number>,\n'
-            '  "replace_count": <number_of_lines>,\n'
-            '  "indent_spaces": <number_of_spaces>\n'
-            "}\n\n"
-            "Rules:\n"
-            "- anchor_line must be a line number from the ORIGINAL code\n"
-            "- replace_count is how many lines AFTER anchor_line to replace\n"
-            "- Use replace_count = 0 for pure insertion\n"
-            "- indent_spaces must match surrounding indentation\n"
-            "- Do NOT list delete lines\n"
-            "- No explanations. JSON only."
+            """You are a deterministic code-edit instruction generator.
+You MUST output ONLY valid JSON. No prose. No markdown.
+
+JSON schema:
+{
+  "anchor_line": <positive integer>,
+  "replace_count": <non-negative integer>,
+  "indent_spaces": <non-negative integer>
+}
+
+HARD RULES (violating any rule is a failure):
+
+1. anchor_line MUST point to a line whose indentation level
+   EXACTLY matches indent_spaces.
+
+2. indent_spaces MUST be EXACTLY the number of leading spaces
+   on anchor_line.
+   - NEVER infer indentation from nearby lines.
+   - NEVER increase indentation beyond anchor_line.
+
+3. All inserted lines MUST use indent_spaces.
+   - You are NOT allowed to introduce deeper indentation.
+   - If deeper indentation is required, anchor_line MUST already
+     be at that indentation level.
+
+4. replace_count MAY ONLY replace lines that:
+   - Are contiguous
+   - Have EXACTLY the same indentation as anchor_line
+   - Do NOT include commented lines with different indentation
+
+5. NEVER create duplicate executable lines.
+   - If a line identical (ignoring quotes and whitespace)
+     to the first line of new code already exists at anchor_line,
+     set replace_count to include it.
+
+6. NEVER insert a statement that is semantically identical
+   to the line being replaced.
+   - If the operation is the same (e.g., same function call,
+     same arguments, same assignment target), you MUST replace,
+     not insert.
+
+7. Comments do NOT count as anchors.
+   - anchor_line MUST reference a non-comment, non-blank line.
+
+8. NEVER anchor:
+   - Inside open parentheses, brackets, or braces
+   - Inside multi-line expressions
+   - Inside argument lists
+   - Between a statement and its continuation
+
+9. If there is ANY ambiguity:
+   - Set replace_count = 0
+   - Anchor immediately BEFORE the intended change
+   - Keep indent_spaces conservative
+
+10. When in doubt:
+    - Prefer replacing a single existing line
+    - Prefer shallower indentation
+    - Prefer fewer edits
+
+Respond with JSON ONLY.
+
+"""
         )
 
         user_prompt = (
