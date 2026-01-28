@@ -83,7 +83,7 @@ class ChatUI:
         self.root.geometry("1100x650")
 
         self.conversation = [
-            {"role": "system", "content": "You are a helpful coding assistant. Your code snippets must never contain ellipses, or any comment meant to represent code. "}
+            {"role": "system", "content": "Your code snippets must NOT contain any comments meant to represent code."}
         ]
 
         self.token_queue = queue.Queue()
@@ -267,13 +267,6 @@ class ChatUI:
         
         # Add user message to conversation
         self.conversation.append({"role": "user", "content": text})
-        
-        # Add invisible context about current code if it exists
-        if self.code_contents.strip():
-            self.conversation.append({
-                "role": "user",
-                "content": f"Here's my current code:\n{self.code_contents}"
-            })
 
         self._start_generation()
         return "break"
@@ -296,20 +289,27 @@ class ChatUI:
             model = self.chat_model.get()
             client = self._get_client_for_model(model)
             max_tokens = self._get_max_tokens_for_model(model)
-            
-            # Build request parameters
+
+            # Build messages dynamically
+            messages = list(self.conversation)
+
+            if self.code_contents.strip():
+                messages.append({
+                    "role": "user",
+                    "content": f"Here is the CURRENT version of my code:\n{self.code_contents}"
+                })
+
             params = {
                 "model": model,
-                "messages": self.conversation,
+                "messages": messages,
                 "stream": True,
             }
-            
-            # Use max_completion_tokens for GPT-5.2 and GPT-5-mini
+
             if self._uses_max_completion_tokens(model):
                 params["max_completion_tokens"] = max_tokens
             else:
                 params["max_tokens"] = max_tokens
-            
+
             stream = client.chat.completions.create(**params)
 
             for chunk in stream:
@@ -322,6 +322,7 @@ class ChatUI:
 
         finally:
             self.token_queue.put(None)
+
 
     def _poll_tokens(self):
         try:
@@ -474,67 +475,46 @@ class ChatUI:
         numbered_code = self._add_line_numbers(self.code_contents)
 
         system_prompt = (
-            """You are a deterministic code-edit instruction generator.
-You MUST output ONLY valid JSON. No prose. No markdown.
+            """You generate deterministic line-edit instructions.
+Output JSON ONLY. No prose.
 
-JSON schema:
+Schema:
 {
-  "anchor_line": <positive integer>,
-  "replace_count": <non-negative integer>,
-  "indent_spaces": <non-negative integer>
+  "anchor_line": int,
+  "replace_count": int,
+  "indent_spaces": int
 }
 
-HARD RULES (violating any rule is a failure):
+STRICT RULES:
 
-1. anchor_line MUST point to a line whose indentation level
-   EXACTLY matches indent_spaces.
+1. If new_code starts with `def ` or `class `:
+   - anchor_line MUST be the line containing the SAME `def` or `class`
+   - replace_count MUST cover the ENTIRE existing block
+   - You are NOT allowed to anchor inside the block
 
-2. indent_spaces MUST be EXACTLY the number of leading spaces
-   on anchor_line.
-   - NEVER infer indentation from nearby lines.
-   - NEVER increase indentation beyond anchor_line.
+2. You MUST treat function and class definitions as ATOMIC.
+   - NEVER insert or replace code inside an existing def/class
+     unless the anchor_line is the def/class line itself
 
-3. All inserted lines MUST use indent_spaces.
-   - You are NOT allowed to introduce deeper indentation.
-   - If deeper indentation is required, anchor_line MUST already
-     be at that indentation level.
+3. anchor_line MUST point to a non-blank, non-comment line.
 
-4. replace_count MAY ONLY replace lines that:
-   - Are contiguous
-   - Have EXACTLY the same indentation as anchor_line
-   - Do NOT include commented lines with different indentation
+4. indent_spaces MUST equal the exact leading spaces of anchor_line.
+   - All inserted lines MUST use this indentation.
 
-5. NEVER create duplicate executable lines.
-   - If a line identical (ignoring quotes and whitespace)
-     to the first line of new code already exists at anchor_line,
-     set replace_count to include it.
+5. replace_count may ONLY include contiguous lines
+   that belong to the SAME block as anchor_line.
 
-6. NEVER insert a statement that is semantically identical
-   to the line being replaced.
-   - If the operation is the same (e.g., same function call,
-     same arguments, same assignment target), you MUST replace,
-     not insert.
+6. NEVER duplicate a definition.
+   - If a matching `def` or `class` already exists, you MUST replace it.
 
-7. Comments do NOT count as anchors.
-   - anchor_line MUST reference a non-comment, non-blank line.
+7. NEVER increase indentation relative to anchor_line.
 
-8. NEVER anchor:
-   - Inside open parentheses, brackets, or braces
-   - Inside multi-line expressions
-   - Inside argument lists
-   - Between a statement and its continuation
+8. If unsure:
+   - Anchor at the definition line
+   - Replace the whole block
 
-9. If there is ANY ambiguity:
-   - Set replace_count = 0
-   - Anchor immediately BEFORE the intended change
-   - Keep indent_spaces conservative
+ORIGINAL CODE (with line numbers):
 
-10. When in doubt:
-    - Prefer replacing a single existing line
-    - Prefer shallower indentation
-    - Prefer fewer edits
-
-Respond with JSON ONLY.
 
 """
         )
@@ -868,30 +848,51 @@ Respond with JSON ONLY.
     # -----------------------------
 
     def _append_chat(self, sender: str, text: str):
-        """Modified for tighter user message spacing."""
+        max_message_length = 1000
+
+        truncated_text = None
+
+        if len(text) > max_message_length:
+            truncated_text = text[:max_message_length] + "... (read more)"
+            self._show_full_message_button(truncated_text, text)
+        else:
+            self._display_full_message(text)
+
+    
+    def _show_full_message_button(self, truncated_text, full_text):
+        # Create a container for the message
         container = ttk.Frame(self.chat_inner_frame)
         container.pack(fill="x", padx=10, pady=5)
-
+    
+        # Display the truncated text
         header = tk.Text(container, height=1, font=("TkDefaultFont", 10, "bold"),
                         relief="flat", background=self.bg_color, highlightthickness=0)
-        header.insert("1.0", f"{sender}:")
+        header.insert("1.0", f"Assistant:")
         header.configure(state="disabled")
         header.pack(fill="x")
-
-        # Dynamic height for content
-        line_count = text.count("\n") + 1
-        body = tk.Text(container, height=line_count, wrap="word", relief="flat",
+    
+        # Display the truncated text with a "read more" button
+        body = tk.Text(container, height=5, wrap="word", relief="flat",
                       background=self.bg_color, highlightthickness=0)
-        body.insert("1.0", text)
+        body.insert("1.0", truncated_text)
         body.configure(state="disabled")
         body.pack(fill="x", padx=5)
-        
-        if sender == "Assistant":
-            self.current_message_label = body
-            self.current_message_container = container
-
-        self.chat_canvas.update_idletasks()
-        self.chat_canvas.yview_moveto(1.0)
+    
+        # Create a "read more" button
+        read_more_button = ttk.Button(container, text="Read more", command=lambda: self._display_full_message(full_text))
+        read_more_button.pack(fill="x")
+    
+    def _display_full_message(self, text):
+        # Create a new window to display the full message
+        message_window = tk.Toplevel(self.root)
+        message_window.title("Full Message")
+    
+        # Display the full message
+        message_text = tk.Text(message_window, wrap="word")
+        message_text.insert("1.0", text)
+        message_text.configure(state="disabled")
+        message_text.pack(fill="both", expand=True)
+    
 
     def _append_to_last_chat(self, text: str):
         """Append text and grow the text widget height dynamically."""
