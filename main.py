@@ -445,62 +445,56 @@ class ChatUI:
             self._append_chat("System", "Helper model did not return valid instructions.")
             return
 
-        # Try to apply the insertion and deletion
         try:
+            # Apply the edit first
             updated_code = self._apply_line_based_edit(
                 insertion_data["insertion_point"],
                 insertion_data["delete_lines"],
                 new_code,
                 insertion_data["indent_spaces"]
             )
+
+            # Deduplicate lines after applying edits
+            updated_code = self._dedupe_post_edit(
+                updated_code,
+                insertion_data["insertion_point"],
+                new_code
+            )
+
             self.code_contents = updated_code
             self.code_panel.delete("1.0", "end")
             self.code_panel.insert("1.0", updated_code)
             self._append_chat("System", "Code updated successfully!")
+
         except Exception as e:
             self._append_chat("System", f"Edit failed: {e}")
 
+
     def _get_insertion_instructions(self, new_code: str) -> dict | None:
-        """
-        Ask helper model for insertion point and lines to delete using line numbers,
-        with up to 3 verification attempts.
-        """
         numbered_code = self._add_line_numbers(self.code_contents)
+
         system_prompt = (
-            "You are a code editing assistant. Your job is to determine where to insert new code "
-            "and which lines (if any) to delete from the existing code.\n\n"
-            "You will receive:\n"
-            "1. The current code with line numbers (format: '1 | code here')\n"
-            "2. New code to insert\n\n"
-            "You must respond ONLY with JSON in this exact format:\n"
+            "You are a deterministic code editing assistant.\n"
+            "You must respond ONLY with JSON in the exact format specified.\n\n"
+            "JSON format:\n"
             "{\n"
-            '  "insertion_point": <line_number>,\n'
-            '  "delete_lines": [<line_numbers>],\n'
+            '  "anchor_line": <line_number>,\n'
+            '  "replace_count": <number_of_lines>,\n'
             '  "indent_spaces": <number_of_spaces>\n'
             "}\n\n"
             "Rules:\n"
-            "- insertion_point: The line number AFTER which to insert the new code (use 0 to insert at the beginning)\n"
-            "- delete_lines: Array of line numbers to delete (can be empty [] if just inserting)\n"
-            "- indent_spaces: Number of spaces to add to the beginning of each line of inserted code (to match surrounding indentation)\n"
-            "- Use the CURRENT line numbers you see - don't worry about how insertion affects numbering\n"
-            "- If replacing code, include those line numbers in delete_lines\n"
-            "- If just inserting, leave delete_lines empty\n"
-            "- Look at the indentation of surrounding code to determine indent_spaces\n\n"
-            "Example 1 - Replace lines 5-7 with 8 spaces of indentation:\n"
-            '{"insertion_point": 4, "delete_lines": [5, 6, 7], "indent_spaces": 8}\n\n'
-            "Example 2 - Insert after line 10 with 4 spaces:\n"
-            '{"insertion_point": 10, "delete_lines": [], "indent_spaces": 4}\n\n'
-            "Example 3 - Insert at beginning with no indentation:\n"
-            '{"insertion_point": 0, "delete_lines": [], "indent_spaces": 0}\n\n'
-            "Respond with ONLY the JSON, no explanations."
+            "- anchor_line must be a line number from the ORIGINAL code\n"
+            "- replace_count is how many lines AFTER anchor_line to replace\n"
+            "- Use replace_count = 0 for pure insertion\n"
+            "- indent_spaces must match surrounding indentation\n"
+            "- Do NOT list delete lines\n"
+            "- No explanations. JSON only."
         )
 
         user_prompt = (
-            "LAST ASSISTANT MESSAGE:\n"
-            f"{self.conversation[-1]['content']}\n"
-            "OLD CODE (with line numbers):\n"
+            "ORIGINAL CODE (with line numbers):\n"
             f"{numbered_code}\n\n"
-            "NEW CODE TO INSERT:\n"
+            "NEW CODE TO INSERT OR REPLACE WITH:\n"
             f"{new_code}\n"
         )
 
@@ -508,75 +502,62 @@ class ChatUI:
         client = self._get_client_for_model(model)
         max_tokens = self._get_max_tokens_for_model(model)
 
-        conversation = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        print("\n===== HELPER INITIAL PROMPT =====")
+        print(system_prompt)
+        print(user_prompt)
 
-        # Initial attempt
-        data = self._call_helper_and_parse(client, model, max_tokens, conversation)
-        if not data:
+        raw = self._call_helper_and_parse(
+            client,
+            model,
+            max_tokens,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        print("Initial helper JSON (raw):", raw)
+
+        if not raw:
+            print("❌ No valid JSON returned")
             return None
 
-        # Up to 3 verification loops
-        for attempt in range(3):
-            try:
-                updated_code = self._apply_line_based_edit(
-                    data["insertion_point"],
-                    data["delete_lines"],
-                    new_code,
-                    data["indent_spaces"]
-                )
-                context_snippet = self._get_modification_context(
-                    updated_code,
-                    data["insertion_point"],
-                    data["delete_lines"],
-                    new_code,
-                    data["indent_spaces"]
-                )
-                verification_prompt = (
-                    "Here is the RESULT of your edit (showing only the modified section with 3 lines before and after):\n\n"
-                    f"{context_snippet}\n\n"
-                    "Check carefully:\n"
-                    "- Is the indentation correct?\n"
-                    "- Is the new code in the right place?\n"
-                    "- Are there any duplicate lines?\n"
-                    "- Does it match the surrounding code style?\n\n"
-                    "If everything looks CORRECT, respond with just: CORRECT\n"
-                    "If something is WRONG, provide corrected JSON with the right insertion_point, delete_lines, and indent_spaces.\n"
-                    "The JSON values you provide should refer to line numbers in the ORIGINAL, OLD CODE."
-                )
-                conversation.append({"role": "assistant", "content": json.dumps(data)})
-                conversation.append({"role": "user", "content": verification_prompt})
+        try:
+            anchor_line = raw["anchor_line"]
+            replace_count = raw["replace_count"]
+            indent_spaces = raw["indent_spaces"]
+        except KeyError as e:
+            print("❌ Missing required key:", e)
+            return None
 
-                params = {
-                    "model": model,
-                    "messages": conversation,
-                }
+        if (
+            not isinstance(anchor_line, int)
+            or anchor_line < 0
+            or not isinstance(replace_count, int)
+            or replace_count < 0
+            or not isinstance(indent_spaces, int)
+            or indent_spaces < 0
+        ):
+            print("❌ Invalid values in helper JSON:", raw)
+            return None
 
-                if self._uses_max_completion_tokens(model):
-                    params["max_completion_tokens"] = max_tokens
-                else:
-                    params["max_tokens"] = max_tokens
+        delete_lines = (
+            list(range(anchor_line + 1, anchor_line + 1 + replace_count))
+            if replace_count > 0
+            else []
+        )
 
-                verification_response = client.chat.completions.create(**params)
-                verification_text = verification_response.choices[0].message.content or ""
+        result = {
+            "insertion_point": anchor_line,
+            "delete_lines": delete_lines,
+            "indent_spaces": indent_spaces,
+        }
 
-                if "CORRECT" in verification_text.upper():
-                    return data
+        print("✅ Final derived insertion instructions:", result)
+        return result
 
-                corrected_data = self._extract_json_from_text(verification_text)
-                if corrected_data and self._validate_json_format(corrected_data):
-                    data = corrected_data
-                else:
-                    # No valid correction, stop early
-                    break
 
-            except Exception:
-                # On error, stop verifying
-                break
 
-        return data
 
     def _get_modification_context(self, updated_code: str, insertion_point: int, 
                                    delete_lines: list, new_code: str, indent_spaces: int) -> str:
@@ -641,27 +622,47 @@ class ChatUI:
             
             print("Helper response:", response_text)
             
-            return self._extract_json_from_text(response_text)
+            raw = self._extract_json_from_text(response_text)
+            return raw
+
             
         except Exception as e:
             print(f"Error calling helper: {e}")
             return None
     
+
     def _extract_json_from_text(self, text: str) -> dict | None:
-        """Extract and parse JSON from text that may contain markdown or other content."""
-        # Try to find JSON in the text
-        json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
-        if json_match:
-            text = json_match.group(0)
-        
-        try:
-            data = json.loads(text)
-            if self._validate_json_format(data):
-                return data
-        except:
-            pass
-        
+        """
+        Extract the first valid JSON object from text.
+        Does NOT validate schema.
+        """
+        import json
+
+        if not text:
+            return None
+
+        # Fast path: whole string is JSON
+        text = text.strip()
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                return json.loads(text)
+            except Exception:
+                pass
+
+        # Fallback: find first {...} block
+        start = text.find("{")
+        while start != -1:
+            end = text.find("}", start)
+            while end != -1:
+                candidate = text[start : end + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    end = text.find("}", end + 1)
+            start = text.find("{", start + 1)
+
         return None
+
     
     def _validate_json_format(self, data: dict) -> bool:
         """Validate that JSON has required fields with correct types."""
@@ -678,6 +679,35 @@ class ChatUI:
             return False
         
         return True
+    
+    def _dedupe_post_edit(self, updated_code: str, insertion_point: int, new_code: str) -> str:
+        """
+        Remove a single duplicate line if the first non-comment line of new_code
+        is identical to the first non-comment line immediately before insertion_point.
+        """
+        lines = updated_code.splitlines()
+        new_lines = [l for l in new_code.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        
+        if not new_lines:
+            return updated_code  # nothing to compare
+        
+        # Find the first non-comment line above insertion_point
+        idx = insertion_point - 1  # convert to 0-based
+        while idx >= 0 and (lines[idx].strip() == "" or lines[idx].lstrip().startswith("#")):
+            idx -= 1
+        
+        if idx >= 0:
+            existing_line = lines[idx].strip()
+            first_new_line = new_lines[0].strip()
+            # Also allow deduping for function/class headers even if whitespace differs
+            both_headers = first_new_line.startswith(("def ", "class ")) and existing_line.startswith(("def ", "class "))
+            if existing_line == first_new_line or both_headers:
+                del lines[idx]
+        
+        return "\n".join(lines)
+
+
+
 
     def _apply_line_based_edit(self, insertion_point: int, delete_lines: list, new_code: str, indent_spaces: int) -> str:
         """Apply insertion and deletion based on line numbers, with indentation."""
