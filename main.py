@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from dotenv import load_dotenv
 from openai import OpenAI
+from groq import Groq
 import json
 
 # -----------------------------
@@ -14,9 +15,8 @@ import json
 
 load_dotenv()
 
-groq_client = OpenAI(
+groq_client = client = Groq(
     api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
 )
 
 openai_client = OpenAI(
@@ -447,19 +447,12 @@ class ChatUI:
             return
 
         try:
-            # Apply the edit first
+            # Apply the edit
             updated_code = self._apply_line_based_edit(
                 insertion_data["insertion_point"],
                 insertion_data["delete_lines"],
                 new_code,
                 insertion_data["indent_spaces"]
-            )
-
-            # Deduplicate lines after applying edits
-            updated_code = self._dedupe_post_edit(
-                updated_code,
-                insertion_data["insertion_point"],
-                new_code
             )
 
             self.code_contents = updated_code
@@ -480,38 +473,28 @@ Output JSON ONLY. No prose.
 
 Schema:
 {
-  "anchor_line": int,
-  "replace_count": int,
-  "indent_spaces": int
+  "first_replace_line",
+  "last_replace_line",
+  "indent_spaces"
 }
+Using this schema will replace a range of lines with the new code. The range is **inclusive**.
+
+Alternative Schema:
+{
+  "insert_at_line",
+  "indent_spaces"
+}
+Using this schema will insert the new code at this line and shift all the code that follows down.
 
 STRICT RULES:
 
-1. If new_code starts with `def ` or `class `:
-   - anchor_line MUST be the line containing the SAME `def` or `class`
-   - replace_count MUST cover the ENTIRE existing block
-   - You are NOT allowed to anchor inside the block
+1. The new code is a suggestion from an assistant. Insert or replace in the most likely place the assistant intended to target.
 
-2. You MUST treat function and class definitions as ATOMIC.
-   - NEVER insert or replace code inside an existing def/class
-     unless the anchor_line is the def/class line itself
+2. If the new code is a complete method or class, replace the entire method or class. 
 
-3. anchor_line MUST point to a non-blank, non-comment line.
+3. Only respond with JSON from one of the two valid schemas.
 
-4. indent_spaces MUST equal the exact leading spaces of anchor_line.
-   - All inserted lines MUST use this indentation.
-
-5. replace_count may ONLY include contiguous lines
-   that belong to the SAME block as anchor_line.
-
-6. NEVER duplicate a definition.
-   - If a matching `def` or `class` already exists, you MUST replace it.
-
-7. NEVER increase indentation relative to anchor_line.
-
-8. If unsure:
-   - Anchor at the definition line
-   - Replace the whole block
+4. Indent spaces is the number of spaces that should be added to the FIRST line of the new code.
 
 ORIGINAL CODE (with line numbers):
 
@@ -522,7 +505,7 @@ ORIGINAL CODE (with line numbers):
         user_prompt = (
             "ORIGINAL CODE (with line numbers):\n"
             f"{numbered_code}\n\n"
-            "NEW CODE TO INSERT OR REPLACE WITH:\n"
+            "NEW CODE TO INSERT OR REPLACE:\n"
             f"{new_code}\n"
         )
 
@@ -551,38 +534,32 @@ ORIGINAL CODE (with line numbers):
             return None
 
         try:
-            anchor_line = raw["anchor_line"]
-            replace_count = raw["replace_count"]
+            first_replace_line = raw["first_replace_line"]
+            last_replace_line = raw["last_replace_line"]
             indent_spaces = raw["indent_spaces"]
+            delete_lines = (
+                list(range(first_replace_line, last_replace_line))
+            )
+            result = {"insertion_point": first_replace_line,
+                    "delete_lines": delete_lines,
+                    "indent_spaces": indent_spaces
+                    }
+            print("✅ Final derived insertion instructions:", result)
+            return result
         except KeyError as e:
-            print("❌ Missing required key:", e)
-            return None
+            try:
+                insert_at_line = raw["insert_at_line"]
+                indent_spaces = raw["indent_spaces"]
+                result = {"insertion_point": insert_at_line,
+                        "delete_lines": [],
+                        "indent_spaces": indent_spaces
+                        }
+                print("✅ Final derived insertion instructions:", result)
+                return result
+            except KeyError as e1:
+                print("❌ Missing required key:", e1)
+                return None
 
-        if (
-            not isinstance(anchor_line, int)
-            or anchor_line < 0
-            or not isinstance(replace_count, int)
-            or replace_count < 0
-            or not isinstance(indent_spaces, int)
-            or indent_spaces < 0
-        ):
-            print("❌ Invalid values in helper JSON:", raw)
-            return None
-
-        delete_lines = (
-            list(range(anchor_line + 1, anchor_line + 1 + replace_count))
-            if replace_count > 0
-            else []
-        )
-
-        result = {
-            "insertion_point": anchor_line,
-            "delete_lines": delete_lines,
-            "indent_spaces": indent_spaces,
-        }
-
-        print("✅ Final derived insertion instructions:", result)
-        return result
 
 
 
@@ -707,70 +684,56 @@ ORIGINAL CODE (with line numbers):
             return False
         
         return True
-    
-    def _dedupe_post_edit(self, updated_code: str, insertion_point: int, new_code: str) -> str:
-        """
-        Remove a single duplicate line if the first non-comment line of new_code
-        is identical to the first non-comment line immediately before insertion_point.
-        """
-        lines = updated_code.splitlines()
-        new_lines = [l for l in new_code.splitlines() if l.strip() and not l.lstrip().startswith("#")]
-        
-        if not new_lines:
-            return updated_code  # nothing to compare
-        
-        # Find the first non-comment line above insertion_point
-        idx = insertion_point - 1  # convert to 0-based
-        while idx >= 0 and (lines[idx].strip() == "" or lines[idx].lstrip().startswith("#")):
-            idx -= 1
-        
-        if idx >= 0:
-            existing_line = lines[idx].strip()
-            first_new_line = new_lines[0].strip()
-            # Also allow deduping for function/class headers even if whitespace differs
-            both_headers = first_new_line.startswith(("def ", "class ")) and existing_line.startswith(("def ", "class "))
-            if existing_line == first_new_line or both_headers:
-                del lines[idx]
-        
-        return "\n".join(lines)
 
-
-
-
-    def _apply_line_based_edit(self, insertion_point: int, delete_lines: list, new_code: str, indent_spaces: int) -> str:
-        """Apply insertion and deletion based on line numbers, with indentation."""
+    def _apply_line_based_edit(
+        self,
+        insertion_point: int,
+        delete_lines: list,
+        new_code: str,
+        indent_spaces: int
+    ) -> str:
+        """Apply insertion and deletion based on 1-indexed line numbers, with indentation."""
+        
         lines = self.code_contents.split("\n")
-        
-        # Validate line numbers
-        if insertion_point < 0 or insertion_point > len(lines):
+        line_count = len(lines)
+
+        # Validate insertion point (1-indexed, inclusive end)
+        if insertion_point < 1 or insertion_point > line_count + 1:
             raise ValueError(f"Invalid insertion point: {insertion_point}")
-        
+
+        # Validate delete lines (1-indexed, inclusive)
         for line_num in delete_lines:
-            if line_num < 1 or line_num > len(lines):
+            if line_num < 1 or line_num > line_count:
                 raise ValueError(f"Invalid line number to delete: {line_num}")
-        
-        # Convert delete_lines to 0-indexed and sort in reverse order
-        delete_indices = sorted([line_num - 1 for line_num in delete_lines], reverse=True)
-        
-        # Adjust insertion point if we're deleting lines before it
-        adjusted_insertion = insertion_point
+
+        # Convert delete_lines to 0-indexed indices and sort descending
+        delete_indices = sorted(
+            (line_num - 1 for line_num in delete_lines),
+            reverse=True
+        )
+
+        # Convert insertion point to 0-indexed
+        insertion_index = insertion_point - 1
+
+        # Adjust insertion index based on deletions before it
         for idx in delete_indices:
-            if idx < insertion_point:
-                adjusted_insertion -= 1
-        
-        # Delete lines (in reverse order to preserve indices)
+            if idx < insertion_index:
+                insertion_index -= 1
+
+        # Delete lines (reverse order preserves indices)
         for idx in delete_indices:
             del lines[idx]
-        
-        # Apply indentation to new code
+
+        # Prepare indented new code
         indent = " " * indent_spaces
         new_lines = new_code.split("\n")
         indented_lines = [indent + line for line in new_lines]
-        
-        # Insert new code at the adjusted position
-        lines[adjusted_insertion:adjusted_insertion] = indented_lines
-        
+
+        # Insert new code
+        lines[insertion_index:insertion_index] = indented_lines
+
         return "\n".join(lines)
+
 
     def _replace_code_panel(self, code: str):
         self.code_contents = code
