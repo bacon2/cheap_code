@@ -83,7 +83,7 @@ class ChatUI:
         self.root.geometry("1100x650")
 
         self.conversation = [
-            {"role": "system", "content": "Your code snippets must NOT contain any comments meant to represent code."}
+            {"role": "system", "content": "Your code snippets must NOT contain any comments meant to represent code. Each method gets a new code block. Never put more than one method in a code block."}
         ]
 
         self.token_queue = queue.Queue()
@@ -812,49 +812,89 @@ ORIGINAL CODE (with line numbers):
 
     def _append_chat(self, sender: str, text: str):
         max_message_length = 1000
-
-        truncated_text = None
-
+    
         if len(text) > max_message_length:
-            truncated_text = text[:max_message_length] + "... (read more)"
-            self._show_full_message_button(truncated_text, text)
+            truncated_text = text[:max_message_length] + "... "
+            self._show_full_message_button(sender, truncated_text, text)
         else:
-            self._display_full_message(text)
+            self._display_full_message(sender, text)
+    
+        self.chat_canvas.update_idletasks()
+        self.chat_canvas.yview_moveto(1.0)
+    
 
     
-    def _show_full_message_button(self, truncated_text, full_text):
-        # Create a container for the message
+    def _show_full_message_button(self, sender: str, truncated_text: str, full_text: str):
         container = ttk.Frame(self.chat_inner_frame)
         container.pack(fill="x", padx=10, pady=5)
     
-        # Display the truncated text
-        header = tk.Text(container, height=1, font=("TkDefaultFont", 10, "bold"),
-                        relief="flat", background=self.bg_color, highlightthickness=0)
-        header.insert("1.0", f"Assistant:")
+        header = tk.Text(
+            container,
+            height=1,
+            font=("TkDefaultFont", 10, "bold"),
+            relief="flat",
+            background=self.bg_color,
+            highlightthickness=0
+        )
+        header.insert("1.0", f"{sender}:")
         header.configure(state="disabled")
         header.pack(fill="x")
     
-        # Display the truncated text with a "read more" button
-        body = tk.Text(container, height=5, wrap="word", relief="flat",
-                      background=self.bg_color, highlightthickness=0)
+        body = tk.Text(
+            container,
+            height=min(8, truncated_text.count("\n") + 2),
+            wrap="word",
+            relief="flat",
+            background=self.bg_color,
+            highlightthickness=0
+        )
         body.insert("1.0", truncated_text)
         body.configure(state="disabled")
-        body.pack(fill="x", padx=5)
+        body.pack(fill="x", padx=5, pady=(2, 2))
     
-        # Create a "read more" button
-        read_more_button = ttk.Button(container, text="Read more", command=lambda: self._display_full_message(full_text))
-        read_more_button.pack(fill="x")
+        def expand_inline():
+            body.configure(state="normal")
+            body.delete("1.0", "end")
+            body.insert("1.0", full_text)
+            new_height = min(30, full_text.count("\n") + 2)
+            body.configure(height=new_height, state="disabled")
+            read_more_button.destroy()
+            self.chat_canvas.update_idletasks()
+            self.chat_canvas.yview_moveto(1.0)
     
-    def _display_full_message(self, text):
-        # Create a new window to display the full message
-        message_window = tk.Toplevel(self.root)
-        message_window.title("Full Message")
+        read_more_button = ttk.Button(container, text="Read more", command=expand_inline)
+        read_more_button.pack(anchor="w", padx=5, pady=(0, 2))
     
-        # Display the full message
-        message_text = tk.Text(message_window, wrap="word")
-        message_text.insert("1.0", text)
-        message_text.configure(state="disabled")
-        message_text.pack(fill="both", expand=True)
+    
+    def _display_full_message(self, sender: str, text: str):
+        container = ttk.Frame(self.chat_inner_frame)
+        container.pack(fill="x", padx=10, pady=5)
+    
+        header = tk.Text(
+            container,
+            height=1,
+            font=("TkDefaultFont", 10, "bold"),
+            relief="flat",
+            background=self.bg_color,
+            highlightthickness=0
+        )
+        header.insert("1.0", f"{sender}:")
+        header.configure(state="disabled")
+        header.pack(fill="x")
+    
+        body_height = min(30, text.count("\n") + 2)
+    
+        body = tk.Text(
+            container,
+            height=body_height,
+            wrap="word",
+            relief="flat",
+            background=self.bg_color,
+            highlightthickness=0
+        )
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+        body.pack(fill="x", padx=5, pady=(2, 2))
     
 
     def _append_to_last_chat(self, text: str):
@@ -874,4 +914,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     ChatUI(root)
     root.mainloop()
+
 
